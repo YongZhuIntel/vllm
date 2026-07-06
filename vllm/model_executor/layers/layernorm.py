@@ -326,6 +326,31 @@ class GemmaRMSNorm(CustomOp):
             self._is_compiled = True
         return self.forward_native(x, residual)
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Gemma weight semantics: x * (1 + w) instead of x * w
+        if not hasattr(self, '_gemma_w'):
+            self._gemma_w = self.weight.data + 1.0
+        if not hasattr(self, '_gemma_w_fp16'):
+            self._gemma_w_fp16 = self._gemma_w.half()
+
+        if residual is not None and x.shape[0] == 1:
+            # Decode fast path: ESIMD kernel (lower dispatch overhead than IPEX)
+            from custom_esimd_kernels_vllm import esimd_fused_add_rms_norm
+            esimd_fused_add_rms_norm(x, residual, self._gemma_w_fp16,
+                                     self.variance_epsilon)
+            return x, residual
+
+        from vllm._ipex_ops import ipex_ops as ops
+        if residual is not None:
+            ops.fused_add_rms_norm(x, residual, self._gemma_w,
+                                   self.variance_epsilon)
+            return x, residual
+        return ops.rms_norm(x, self._gemma_w, self.variance_epsilon)
+
 
 # --8<-- [start:rms_norm_gated]
 @CustomOp.register("rms_norm_gated")
@@ -432,6 +457,31 @@ class RMSNormGated(CustomOp):
             norm_before_gate=self.norm_before_gate,
         )
 
+    def forward_xpu(
+        self, x: torch.Tensor, z: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        from vllm.model_executor.layers.fla.ops.layernorm_guard import (
+            layer_norm_fwd,
+        )
+
+        # Bypass rmsnorm_fn -> LayerNormFn.apply -> @input_guard path
+        # to avoid: unconditional .contiguous(), torch.xpu.device() ctx,
+        # autograd save_for_backward, and per-call tensor allocations.
+        x_shape_og = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        if z is not None:
+            z = z.reshape(-1, z.shape[-1])
+        y, _, _ = layer_norm_fwd(
+            x,
+            self.weight,
+            self.bias,
+            self.eps,
+            z=z,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+        )
+        return y.reshape(x_shape_og)
 
 class LayerNorm(nn.Module):
     """

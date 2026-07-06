@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import importlib
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -19,6 +20,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_supports_fp8,
+    flash_attn_supports_quant_query_input,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
@@ -39,6 +41,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
@@ -61,6 +64,8 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_xpu():
+            return [64]
         vllm_config = get_current_vllm_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -120,12 +125,20 @@ class FlashAttentionBackend(AttentionBackend):
         # `stride_order` indicates the permutation that gets
         # us from `get_kv_cache_shape` to the actual memory layout we want.
         cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD" and include_num_layers_dimension:
+        if (
+            cache_layout == "NHD"
+            and include_num_layers_dimension
+            and not current_platform.is_xpu()
+        ):
             # (num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)
             return (2, 0, 1, 3, 4, 5)
         elif cache_layout == "NHD":
             stride_order = (0, 1, 2, 3, 4)
-        elif cache_layout == "HND" and include_num_layers_dimension:
+        elif (
+            cache_layout == "HND"
+            and include_num_layers_dimension
+            and not current_platform.is_xpu()
+        ):
             # (num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)
             return (2, 4, 0, 1, 3, 5)
         elif cache_layout == "HND":
@@ -575,7 +588,7 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        self.supports_quant_query_input = True
+        self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
     def forward(
         self,
@@ -706,6 +719,53 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
+                if (
+                    current_platform.is_xpu()
+                    and attn_type == AttentionType.DECODER
+                    and attn_metadata.max_query_len == 1
+                    and self.head_size == 256
+                ):
+                    try:
+                        eagle_ops = importlib.import_module("custom_esimd_kernels_vllm.eagle_ops")
+                    except ImportError:
+                        eagle_ops = None
+
+                    if eagle_ops is not None:
+                        _q = query[:num_actual_tokens]
+                        _o = output[:num_actual_tokens]
+                        _num_q = _q.shape[1]
+                        _num_kv = kv_cache.shape[3]
+                        _gqa = _num_q // _num_kv if _num_kv > 0 else 0
+                        _need_pad = (_gqa >= 2 and _gqa % 4 != 0)
+
+                        if _need_pad:
+                            # Pad Q heads per KV group to next multiple of 4
+                            _padded_gqa = ((_gqa + 3) // 4) * 4
+                            _pad_per_kv = _padded_gqa - _gqa
+                            # Interleave pad: reshape [bs, num_kv*gqa, hd] → [bs, num_kv, gqa, hd]
+                            # → pad to [bs, num_kv, padded_gqa, hd] → reshape back
+                            _bs, _, _hd = _q.shape
+                            _q_grouped = _q.reshape(_bs, _num_kv, _gqa, _hd)
+                            _q_pad = torch.nn.functional.pad(
+                                _q_grouped, (0, 0, 0, _pad_per_kv))  # pad gqa dim
+                            _q_pad = _q_pad.reshape(_bs, _num_kv * _padded_gqa, _hd).contiguous()
+                            _o_pad = torch.zeros_like(_q_pad)
+                            eagle_ops.page_attn_decode(
+                                _q_pad, kv_cache, block_table, seqused_k,
+                                _o_pad, 1, attn_metadata.max_seq_len)
+                            # Unpad: reshape back and take first _gqa heads per KV group
+                            _o_grouped = _o_pad.reshape(_bs, _num_kv, _padded_gqa, _hd)
+                            _o.copy_(_o_grouped[:, :, :_gqa, :].reshape(_bs, _num_q, _hd))
+                        elif _gqa >= 4:
+                            eagle_ops.page_attn_decode(
+                                _q, kv_cache, block_table, seqused_k,
+                                _o, 1, attn_metadata.max_seq_len)
+                        else:
+                            eagle_ops = None  # unsupported, fall through
+
+                        if eagle_ops is not None:
+                            return output
+
                 sliding_window_size = (
                     list(self.sliding_window)
                     if self.sliding_window is not None

@@ -91,18 +91,29 @@ class CPUOffloadingSpec(OffloadingSpec):
         attn_backends: dict[str, type[AttentionBackend]],
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         if not self._handlers:
-            if not current_platform.is_cuda_alike():
+            if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
                 raise Exception(
                     "CPU Offloading is currently only supported on CUDA-alike GPUs"
+                    " and Intel XPUs"
                 )
+            if current_platform.is_xpu():
+                from vllm.v1.kv_offload.worker.cpu_xpu import CpuXpuOffloadingHandlers
 
-            self._handlers = CpuGpuOffloadingHandlers(
-                attn_backends=attn_backends,
-                gpu_block_size=self.gpu_block_size,
-                cpu_block_size=self.offloaded_block_size,
-                num_cpu_blocks=self.num_blocks,
-                gpu_caches=kv_caches,
-            )
+                self._handlers = CpuXpuOffloadingHandlers(
+                    attn_backends=attn_backends,
+                    gpu_block_size=self.gpu_block_size,
+                    cpu_block_size=self.offloaded_block_size,
+                    num_cpu_blocks=self.num_blocks,
+                    gpu_caches=kv_caches,
+                )
+            else:
+                self._handlers = CpuGpuOffloadingHandlers(
+                    attn_backends=attn_backends,
+                    gpu_block_size=self.gpu_block_size,
+                    cpu_block_size=self.offloaded_block_size,
+                    num_cpu_blocks=self.num_blocks,
+                    gpu_caches=kv_caches,
+                )
 
         assert self._handlers is not None
         yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler

@@ -23,6 +23,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.profiler.wrapper import get_torch_profiler_trace_handler
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
@@ -178,10 +179,9 @@ class AsyncLLM(EngineClient):
                     torch.profiler.ProfilerActivity.CPU,
                 ],
                 with_stack=vllm_config.profiler_config.torch_profiler_with_stack,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    profiler_dir,
-                    worker_name=worker_name,
-                    use_gzip=vllm_config.profiler_config.torch_profiler_use_gzip,
+                on_trace_ready=get_torch_profiler_trace_handler(
+                    vllm_config.profiler_config,
+                    worker_name,
                 ),
             )
         else:

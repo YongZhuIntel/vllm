@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_TORCH_PROFILER_WITH_STACK: str | None = None
     VLLM_TORCH_PROFILER_WITH_FLOPS: str | None = None
     VLLM_TORCH_PROFILER_USE_GZIP: str | None = None
+    VLLM_TORCH_PROFILER_SAVE_TRACES: str | None = None
     VLLM_TORCH_PROFILER_DUMP_CUDA_TIME_TOTAL: str | None = None
     VLLM_PROFILER_DELAY_ITERS: str | None = None
     VLLM_PROFILER_MAX_ITERS: str | None = None
@@ -252,6 +253,9 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_XPU_FP8_DTYPE: str = "e5m2"
+    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: bool = True
+    VLLM_QUANTIZE_Q40_LIB: str = "/opt/lib/vllm_int4_for_multi_arc.so"
 
 
 def get_default_cache_root():
@@ -442,9 +446,9 @@ def get_vllm_port() -> int | None:
     try:
         return int(port)
     except ValueError as err:
-        from urllib.parse import urlparse
+        from urllib3.util import parse_url
 
-        parsed = urlparse(port)
+        parsed = parse_url(port)
         if parsed.scheme:
             raise ValueError(
                 f"VLLM_PORT '{port}' appears to be a URI. "
@@ -909,6 +913,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Control whether torch profiler gzip-compresses profiling files.
     # Deprecated, see profiler_config.
     "VLLM_TORCH_PROFILER_USE_GZIP": lambda: os.getenv("VLLM_TORCH_PROFILER_USE_GZIP"),
+    # Control whether torch profiler saves trace files.
+    # Set to 0 to only keep the aggregated text outputs.
+    # Deprecated, see profiler_config.
+    "VLLM_TORCH_PROFILER_SAVE_TRACES": lambda: os.getenv(
+        "VLLM_TORCH_PROFILER_SAVE_TRACES"
+    ),
     # Control whether torch profiler dumps the self_cuda_time_total table.
     # Set to 0 to disable dumping the table.
     # Deprecated, see profiler_config.
@@ -1611,6 +1621,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
     ),
+    # fp8 dtype for XPU platform
+    "VLLM_XPU_FP8_DTYPE": lambda: os.environ.get("VLLM_XPU_FP8_DTYPE", "e5m2"),
+    # Offload model weights to cpu before online fp8 quantization
+    "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT": lambda: os.environ.get(
+        "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT", "0"
+    )
+    == "1",
+
+    # Path for finding libs for vLLM sym_int4 quantization support
+    "VLLM_QUANTIZE_Q40_LIB":
+    lambda: os.environ.get("VLLM_QUANTIZE_Q40_LIB", "/opt/lib/vllm_int4_for_multi_arc.so"),
+
 }
 
 # --8<-- [end:env-vars-definition]

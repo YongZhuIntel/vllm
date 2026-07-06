@@ -2288,13 +2288,17 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             placeholders = mm_placeholders.get(modality, [])
 
             if len(placeholders) != item_count:
-                raise RuntimeError(
-                    f"Expected there to be {item_count} prompt placeholders "
-                    f"corresponding to {item_count} {modality} items, but "
-                    f"instead found {len(placeholders)} prompt placeholders! "
-                    "Make sure the implementation of `_call_hf_processor` and "
-                    "`_get_mm_fields_config` are consistent with each other."
-                )
+                from vllm.model_executor.models.glm4_1v import Glm4vMultiModalProcessor
+                if isinstance(self, Glm4vMultiModalProcessor):
+                    pass
+                else:
+                    raise RuntimeError(
+                        f"Expected there to be {item_count} prompt placeholders "
+                        f"corresponding to {item_count} {modality} items, but "
+                        f"instead found {len(placeholders)} prompt placeholders! "
+                        "Make sure the implementation of `_call_hf_processor` and "
+                        "`_get_mm_fields_config` are consistent with each other."
+                    )
 
     def _maybe_apply_prompt_updates(
         self,

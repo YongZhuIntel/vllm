@@ -63,14 +63,17 @@ class SharedFusedMoE(FusedMoE):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_overlapped:
             if self._shared_experts is not None:
+                print("Computing shared expert outputs...")
                 shared_out = self._shared_experts(hidden_states)
 
                 # Reduce shared expert outputs if necessary, since the MLP
                 # should have been created with reduce_results=False.
+                import os
                 if (
                     self.reduce_results
                     and get_tensor_model_parallel_world_size() > 1
                     and self.must_reduce_shared_expert_outputs()
+                    and os.environ.get("SKIP_ALL_REDUCE", "0") != "1"
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
             else:
@@ -86,11 +89,13 @@ class SharedFusedMoE(FusedMoE):
                 router_logits=router_logits,
             )
             # ensure early TP reduction of shared expert outputs when required
+            import os
             if (
                 shared_out is not None
                 and self.reduce_results
                 and get_tensor_model_parallel_world_size() > 1
                 and self.must_reduce_shared_expert_outputs()
+                and os.environ.get("SKIP_ALL_REDUCE", "0") != "1"
             ):
                 shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out, fused_out

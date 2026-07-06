@@ -354,6 +354,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
             multimodal_config=multimodal_config,
+            attn_backend_override=AttentionBackendEnum.IPEX,
         )
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)

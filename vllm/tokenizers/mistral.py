@@ -112,6 +112,8 @@ def _prepare_apply_chat_template_tools_and_messages(
     continue_final_message: bool = False,
     add_generation_prompt: bool = False,
 ) -> tuple[list["ChatCompletionMessageParam"], list[dict[str, Any]] | None]:
+    from mistral_common.protocol.instruct.tool_calls import Function, Tool
+
     if add_generation_prompt and continue_final_message:
         raise ValueError(
             "Cannot set both `add_generation_prompt` and "

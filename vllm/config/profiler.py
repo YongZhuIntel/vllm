@@ -43,6 +43,9 @@ class ProfilerConfig:
     torch_profiler_use_gzip: bool = True
     """If `True`, saves torch profiler traces in gzip format. Enabled by default"""
 
+    torch_profiler_save_traces: bool = True
+    """If `True`, saves torch profiler trace files. Enabled by default."""
+
     torch_profiler_dump_cuda_time_total: bool = True
     """If `True`, dumps total CUDA time in torch profiler traces. Enabled by default."""
 
@@ -157,6 +160,10 @@ class ProfilerConfig:
                 self._set_from_env_if_set(
                     "torch_profiler_use_gzip",
                     "VLLM_TORCH_PROFILER_USE_GZIP",
+                )
+                self._set_from_env_if_set(
+                    "torch_profiler_save_traces",
+                    "VLLM_TORCH_PROFILER_SAVE_TRACES",
                 )
                 self._set_from_env_if_set(
                     "torch_profiler_dump_cuda_time_total",

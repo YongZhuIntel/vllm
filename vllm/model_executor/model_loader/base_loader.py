@@ -58,6 +58,19 @@ class BaseModelLoader(ABC):
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, target_device)
 
+            if target_device.type == "xpu":
+                try:
+                    peak_mem = torch.xpu.max_memory_allocated()
+                    current_mem = torch.xpu.memory_allocated()
+                    logger.info(
+                        "Peak XPU memory after loading weights: "
+                        "peak=%.2f GiB, current=%.2f GiB",
+                        peak_mem / (1024**3),
+                        current_mem / (1024**3),
+                    )
+                except Exception:
+                    pass
+
         return model.eval()
 
 

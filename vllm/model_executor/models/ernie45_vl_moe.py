@@ -330,9 +330,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
         if visual_token_mask is not None and visual_token_mask.all():
             # only vision modal input
-            router_logits, _ = self.vision_experts_gate(
-                hidden_states.to(dtype=torch.float32)
-            )
+            router_logits, _ = self.vision_experts_gate(hidden_states)
             final_hidden_states = self.vision_experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -352,9 +350,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 -1, self.hidden_size
             )
 
-            text_router_logits, _ = self.text_experts_gate(
-                text_hidden_states.to(dtype=torch.float32)
-            )
+            text_router_logits, _ = self.text_experts_gate(text_hidden_states)
             text_shared_ouput, text_experts_output = self.text_experts(
                 hidden_states=text_hidden_states, router_logits=text_router_logits
             )
@@ -362,9 +358,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             if self.has_shared_experts:
                 final_shared_ouput[text_token_mask] = text_shared_ouput.flatten()
 
-            vision_router_logits, _ = self.vision_experts_gate(
-                vision_hidden_states.to(dtype=torch.float32)
-            )
+            vision_router_logits, _ = self.vision_experts_gate(vision_hidden_states)
             vision_shared_ouput, vision_experts_output = self.vision_experts(
                 hidden_states=vision_hidden_states, router_logits=vision_router_logits
             )
@@ -377,9 +371,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             final_hidden_states = (final_shared_ouput, final_experts_hidden_states)
         else:
             # only text modal input
-            text_router_logits, _ = self.text_experts_gate(
-                hidden_states.to(dtype=torch.float32)
-            )
+            text_router_logits, _ = self.text_experts_gate(hidden_states)
 
             final_hidden_states = self.text_experts(
                 hidden_states=hidden_states, router_logits=text_router_logits

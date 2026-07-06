@@ -6,7 +6,10 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import vllm_xpu_kernels._C
+import vllm_xpu_kernels._xpu_C
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -78,9 +81,10 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
-        # XPU only supports FLASH_ATTN for vision attention.
+        # XPU supports FLASH_ATTN and IPEX for vision attention.
         return [
             AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.IPEX,
         ]
 
     @classmethod
@@ -206,7 +210,10 @@ class XPUPlatform(Platform):
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
-        return torch.float8_e5m2
+        if envs.VLLM_XPU_FP8_DTYPE == "e4m3":
+            return torch.float8_e4m3fn
+        else:
+            return torch.float8_e5m2
 
     @classmethod
     def is_data_center_gpu(cls) -> bool:

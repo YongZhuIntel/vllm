@@ -23,6 +23,7 @@ from vllm.config import ModelConfig, SpeechToTextConfig
 from vllm.inputs import TokensPrompt
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.func_utils import supports_kw
 
@@ -636,6 +637,19 @@ class IsHybrid(Protocol):
         """
         ...
 
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, ...]:
+        """Calculate copy-function callables for each Mamba state.
+
+        Returns:
+            A tuple of MambaStateCopyFunc callables that correspond, in order,
+            to the Mamba states produced by the model. Each callable accepts
+            (state, block_ids, cur_block_idx, num_accepted_tokens) and returns
+            a MambaCopySpec describing the memory-copy parameters for prefix
+            caching in align mode.
+        """
+        ...
+
 
 @overload
 def is_hybrid(model: object) -> TypeIs[IsHybrid]: ...
@@ -952,6 +966,22 @@ class SupportsTranscription(Protocol):
         This is used for estimating the amount of processing for this audio.
         """
         return None
+
+    @classmethod
+    def post_process_output(cls, text: str) -> str:
+        """
+        Post-process the raw model output text.
+
+        Some ASR models output structured formats (e.g., language tags,
+        special tokens) that need to be stripped before returning to the user.
+
+        Args:
+            text: Raw decoded text from the model.
+
+        Returns:
+            Cleaned transcription text.
+        """
+        return text
 
 
 @overload

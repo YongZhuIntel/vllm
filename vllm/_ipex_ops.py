@@ -142,9 +142,8 @@ class ipex_ops:
         cos_sin_cache: torch.Tensor,  # [cos_sin_dim, rot_dim]
         is_neox: bool,
     ) -> None:
-        rot_dim = cos_sin_cache.size(1)
-        ipex.llm.functional.rotary_embedding_batched(
-            positions, query, key, head_size, cos_sin_cache, is_neox, rot_dim
+        torch.ops.torch_ipex.rotary_embedding(
+            positions, query, key, head_size, cos_sin_cache, is_neox
         )
 
     @staticmethod

@@ -329,6 +329,7 @@ class Qwen2VisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
             multimodal_config=multimodal_config,
+            attn_backend_override=AttentionBackendEnum.IPEX,
         )
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
@@ -870,8 +871,8 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
                 height=image_height,
                 width=image_width,
                 factor=patch_size * merge_size,
-                min_pixels=image_processor.min_pixels,
-                max_pixels=image_processor.max_pixels,
+                min_pixels=image_processor.size["shortest_edge"],
+                max_pixels=image_processor.size["longest_edge"],
             )
             preprocessed_size = ImageSize(width=resized_width, height=resized_height)
         else:
@@ -921,7 +922,7 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         )
         return num_video_tokens
 
-    def get_image_size_with_most_features(self) -> ImageSize:
+    def get_image_size_with_most_features(self, max_pixels: int | None = None) -> ImageSize:
         # NOTE: Simply processing a huge size with _get_vision_info might not give a
         # size that maximizes the number of featrues, i.e., the number of (merged)
         # patches. This is because the number of patches limits the allowed aspect
@@ -939,8 +940,9 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         vision_config = hf_config.vision_config
         patch_size = vision_config.patch_size
         merge_size = vision_config.spatial_merge_size
-        image_processor = self.get_image_processor()
-        max_pixels = image_processor.max_pixels or image_processor.size["longest_edge"]
+        if max_pixels is None:
+            image_processor = self.get_image_processor()
+            max_pixels = image_processor.size["longest_edge"]
         unit = patch_size * merge_size
         max_seq_len = max_pixels // (unit * unit)
 

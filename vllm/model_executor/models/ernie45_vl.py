@@ -154,6 +154,7 @@ class Ernie4_5_VisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
             multimodal_config=multimodal_config,
+            attn_backend_override=AttentionBackendEnum.IPEX,
             prefix=f"{prefix}.attn",
         )
 
@@ -457,7 +458,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
     def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:
         max_seqlen = None
         if (
-            self.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            self.attn_backend == AttentionBackendEnum.FLASH_ATTN or self.attn_backend == AttentionBackendEnum.IPEX
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
         ):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()

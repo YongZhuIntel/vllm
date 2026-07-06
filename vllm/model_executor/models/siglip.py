@@ -403,13 +403,16 @@ class SiglipAttention(nn.Module):
         )
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
+        # Use IPEX backend for MMEncoderAttention to optimize XPU performance
         if attn_cls == MMEncoderAttention:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
             self.attn = attn_cls(
                 self.num_heads_per_partition,
                 self.head_dim,
                 self.scale,
                 prefix=f"{prefix}.attn",
                 multimodal_config=multimodal_config,
+                attn_backend_override=AttentionBackendEnum.IPEX,
             )
         else:
             self.attn = attn_cls(

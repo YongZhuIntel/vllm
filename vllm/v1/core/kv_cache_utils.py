@@ -1219,7 +1219,10 @@ def get_kv_cache_groups(
         The generated KVCacheGroups
     """
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        unify_hybrid_kv_cache_specs(kv_cache_spec)
+        if vllm_config.model_config.hf_config.model_type == "whisper":
+            pass
+        else:
+            unify_hybrid_kv_cache_specs(kv_cache_spec)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns an empty list to allow for the KVCacheManager to handle

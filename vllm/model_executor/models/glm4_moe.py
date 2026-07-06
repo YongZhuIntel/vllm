@@ -672,7 +672,6 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, Glm4MixtureOfExper
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-
             assert isinstance(layer, Glm4MoeDecoderLayer)
             if isinstance(layer.mlp, Glm4MoE):
                 # Pick last one layer since the first ones may be dense layers.
