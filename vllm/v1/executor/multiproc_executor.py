@@ -579,6 +579,26 @@ class WorkerProc:
         # Create death pipe to detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
 
+        process_env: dict[str, str] | None = None
+        if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1":
+            masks = os.getenv("VLLM_XPU_IGPU_PP_MASKS", "0,1").split(",")
+            if local_rank >= len(masks):
+                raise RuntimeError(
+                    "VLLM_XPU_IGPU_PP_MASKS does not cover "
+                    f"local_rank={local_rank}: {masks}"
+                )
+            # VLLM_XPU_IGPU_PP: set per-worker XPU affinity before torch.xpu
+            # initializes. The parent temporarily applies this env for spawn,
+            # and worker_main applies it again before WorkerProc construction.
+            process_env = {
+                "ZE_AFFINITY_MASK": masks[local_rank].strip(),
+                "CCL_LOCAL_RANK": str(local_rank),
+                "CCL_LOCAL_SIZE": str(vllm_config.parallel_config.world_size),
+                "CCL_WORLD_SIZE": str(vllm_config.parallel_config.world_size),
+                "CCL_PROCESS_LAUNCHER": os.getenv("CCL_PROCESS_LAUNCHER", "none"),
+                "CCL_ATL_TRANSPORT": os.getenv("CCL_ATL_TRANSPORT", "ofi"),
+            }
+
         process_kwargs = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
@@ -588,6 +608,7 @@ class WorkerProc:
             "ready_pipe": (reader, writer),
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
+            "process_env": process_env,
         }
         # Run EngineCore busy loop in background process.
         proc = context.Process(
@@ -597,7 +618,18 @@ class WorkerProc:
             daemon=True,
         )
 
-        proc.start()
+        old_env: dict[str, str | None] = {}
+        if process_env is not None:
+            old_env = {key: os.environ.get(key) for key in process_env}
+            os.environ.update(process_env)
+        try:
+            proc.start()
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         writer.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
@@ -674,6 +706,12 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+
+        process_env = kwargs.pop("process_env", None)
+        if process_env is not None:
+            # VLLM_XPU_IGPU_PP: re-apply per-worker env in the child before
+            # WorkerProc initializes torch.xpu and distributed state.
+            os.environ.update(process_env)
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

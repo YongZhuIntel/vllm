@@ -97,7 +97,8 @@ class XPUWorker(Worker):
         # profiled peak memory.
         torch.xpu.synchronize()
         used_memory = torch.xpu.memory_allocated()
-        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
+        device_index = getattr(self, "device_index", self.local_rank)
+        total_gpu_memory = torch.xpu.get_device_properties(device_index).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 
         # NOTE(woosuk): Here we assume that the other processes using the same
@@ -136,7 +137,8 @@ class XPUWorker(Worker):
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         torch.xpu.synchronize()
-        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
+        device_index = getattr(self, "device_index", self.local_rank)
+        total_gpu_memory = torch.xpu.get_device_properties(device_index).total_memory
 
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
@@ -171,12 +173,17 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            self.device = torch.device(f"xpu:{self.local_rank}")
+            # VLLM_XPU_IGPU_PP: each worker is masked to one physical XPU, so
+            # both PP ranks must use the process-local xpu:0 device.
+            self.device_index = (
+                0 if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1" else self.local_rank
+            )
+            self.device = torch.device(f"xpu:{self.device_index}")
             current_platform.set_device(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.xpu.empty_cache()
             self.init_gpu_memory = torch.xpu.get_device_properties(
-                self.local_rank
+                self.device_index
             ).total_memory
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
@@ -197,10 +204,11 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
-        # global all_reduce needed for overall oneccl warm up
-        torch.distributed.all_reduce(
-            torch.zeros(1).xpu(), group=get_world_group().device_group
-        )
+        if os.getenv("VLLM_XPU_IGPU_PP", "0") != "1":
+            # global all_reduce needed for overall oneccl warm up
+            torch.distributed.all_reduce(
+                torch.zeros(1).xpu(), group=get_world_group().device_group
+            )
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
