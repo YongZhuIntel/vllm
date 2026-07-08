@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -349,7 +350,12 @@ class GroupCoordinator:
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{local_rank}")
+            # VLLM_XPU_IGPU_PP: per-rank ZE_AFFINITY_MASK makes each worker see
+            # exactly one XPU, exposed as process-local xpu:0.
+            device_index = (
+                0 if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1" else local_rank
+            )
+            self.device = torch.device(f"xpu:{device_index}")
         elif current_platform.is_out_of_tree():
             self.device = torch.device(f"{current_platform.device_name}:{local_rank}")
         else:
@@ -384,6 +390,13 @@ class GroupCoordinator:
 
         self.use_cpu_custom_send_recv = current_platform.is_cpu() and hasattr(
             torch.ops._C, "init_shm_manager"
+        )
+        self.use_xpu_igpu_pp_send_recv = (
+            # VLLM_XPU_IGPU_PP: route only PP tensor dictionaries through the
+            # oneCCL iGPU plugin communicator; TP/DP collectives stay unchanged.
+            current_platform.is_xpu()
+            and os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+            and self.unique_name.startswith("pp")
         )
 
     def create_mq_broadcaster(
@@ -830,6 +843,18 @@ class GroupCoordinator:
             )
             return None
 
+        if self.use_xpu_igpu_pp_send_recv:
+            if all_gather_group is not None and all_gather_group.world_size != 1:
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_PP does not support send-allgather yet"
+                )
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            self.device_communicator.send_tensor_dict(  # type: ignore
+                tensor_dict, dst
+            )
+            return None
+
         metadata_list: list[tuple[Any, Any]] = []
         assert isinstance(tensor_dict, dict), (
             f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -910,6 +935,17 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            return self.device_communicator.recv_tensor_dict(  # type: ignore
+                src
+            )
+
+        if self.use_xpu_igpu_pp_send_recv:
+            if all_gather_group is not None and all_gather_group.world_size != 1:
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_PP does not support send-allgather yet"
+                )
             if self.device_communicator is None:
                 raise ValueError("No device communicator found")
             return self.device_communicator.recv_tensor_dict(  # type: ignore

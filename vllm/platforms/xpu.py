@@ -222,6 +222,10 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
+        if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1":
+            # VLLM_XPU_IGPU_PP: PP activation tensors use oneCCL v2 C API and
+            # libccl_igpu.so instead of torch.distributed send/recv.
+            return "vllm.distributed.device_communicators.oneccl_igpu_communicator.OneCCLIgpuCommunicator"  # noqa
         return "vllm.distributed.device_communicators.xpu_communicator.XpuCommunicator"  # noqa
 
     @classmethod
