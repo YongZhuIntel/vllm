@@ -350,11 +350,13 @@ class GroupCoordinator:
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_xpu():
-            # VLLM_XPU_IGPU_PP: per-rank ZE_AFFINITY_MASK makes each worker see
-            # exactly one XPU, exposed as process-local xpu:0.
-            device_index = (
-                0 if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1" else local_rank
+            # VLLM_XPU_IGPU_{PP,TP}: per-rank ZE_AFFINITY_MASK makes each worker
+            # see exactly one XPU, exposed as process-local xpu:0.
+            igpu = (
+                os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+                or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
             )
+            device_index = 0 if igpu else local_rank
             self.device = torch.device(f"xpu:{device_index}")
         elif current_platform.is_out_of_tree():
             self.device = torch.device(f"{current_platform.device_name}:{local_rank}")

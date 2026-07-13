@@ -14,9 +14,17 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 ONECCL_SUCCESS = 0
+# onecclDataType_t (include/oneapi/ccl/v2/types.h)
+ONECCL_INT8 = 0
+ONECCL_UINT8 = 1
+ONECCL_INT32 = 2
+ONECCL_INT64 = 4
 ONECCL_FLOAT16 = 6
 ONECCL_FLOAT32 = 7
+ONECCL_FLOAT64 = 8
 ONECCL_BFLOAT16 = 9
+# onecclRedOp_t (include/oneapi/ccl/v2/types.h)
+ONECCL_SUM = 0
 UNIQUE_ID_BYTES = 4096
 
 
@@ -71,6 +79,40 @@ class OneCCL:
         lib.onecclMemAlloc.restype = ctypes.c_int
         lib.onecclMemFree.argtypes = [ctypes.c_void_p]
         lib.onecclMemFree.restype = ctypes.c_int
+        # VLLM_XPU_IGPU_TP: TP collectives use the plugin's fused
+        # reduce+broadcast / gather kernels (see plugins/igpu allreduce.cpp,
+        # allgather.cpp) instead of torch.distributed on the mixed dGPU/iGPU.
+        lib.onecclAllReduce.argtypes = [
+            ctypes.c_void_p,  # sendbuff
+            ctypes.c_void_p,  # recvbuff
+            ctypes.c_size_t,  # count
+            ctypes.c_int,  # datatype
+            ctypes.c_int,  # reduction_op
+            ctypes.c_void_p,  # comm
+            ctypes.c_void_p,  # stream
+        ]
+        lib.onecclAllReduce.restype = ctypes.c_int
+        lib.onecclAllGather.argtypes = [
+            ctypes.c_void_p,  # sendbuff
+            ctypes.c_void_p,  # recvbuff
+            ctypes.c_size_t,  # sendcount
+            ctypes.c_int,  # datatype
+            ctypes.c_void_p,  # comm
+            ctypes.c_void_p,  # stream
+        ]
+        lib.onecclAllGather.restype = ctypes.c_int
+        # VLLM_XPU_IGPU_TP: register reused collective buffers so the plugin
+        # runs its fd handshake once (then skips it), restoring small-message
+        # latency. Must be paired symmetrically across ranks.
+        lib.onecclCommRegister.argtypes = [
+            ctypes.c_void_p,  # comm
+            ctypes.c_void_p,  # buff
+            ctypes.c_size_t,  # size
+            ctypes.POINTER(ctypes.c_void_p),  # handle (out)
+        ]
+        lib.onecclCommRegister.restype = ctypes.c_int
+        lib.onecclCommDeregister.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.onecclCommDeregister.restype = ctypes.c_int
 
     def _check(self, fn: str, code: int) -> None:
         if code != ONECCL_SUCCESS:
@@ -118,6 +160,53 @@ class OneCCL:
             ),
         )
 
+    def all_reduce(
+        self, sendptr: int, recvptr: int, count: int, dtype: int, op: int, stream: int
+    ) -> None:
+        self._check(
+            "onecclAllReduce",
+            self.lib.onecclAllReduce(
+                ctypes.c_void_p(sendptr),
+                ctypes.c_void_p(recvptr),
+                count,
+                dtype,
+                op,
+                self._comm,
+                ctypes.c_void_p(stream),
+            ),
+        )
+
+    def all_gather(
+        self, sendptr: int, recvptr: int, sendcount: int, dtype: int, stream: int
+    ) -> None:
+        self._check(
+            "onecclAllGather",
+            self.lib.onecclAllGather(
+                ctypes.c_void_p(sendptr),
+                ctypes.c_void_p(recvptr),
+                sendcount,
+                dtype,
+                self._comm,
+                ctypes.c_void_p(stream),
+            ),
+        )
+
+    def comm_register(self, ptr: int, size: int) -> int:
+        handle = ctypes.c_void_p()
+        self._check(
+            "onecclCommRegister",
+            self.lib.onecclCommRegister(
+                self._comm, ctypes.c_void_p(ptr), size, ctypes.byref(handle)
+            ),
+        )
+        return handle.value if handle.value is not None else ptr
+
+    def comm_deregister(self, handle: int) -> None:
+        self._check(
+            "onecclCommDeregister",
+            self.lib.onecclCommDeregister(self._comm, ctypes.c_void_p(handle)),
+        )
+
     def mem_alloc(self, size: int) -> int:
         ptr = ctypes.c_void_p()
         self._check("onecclMemAlloc", self.lib.onecclMemAlloc(ctypes.byref(ptr), size))
@@ -144,6 +233,23 @@ class _PreparedTensor:
     host_ptr: int | None = None
 
 
+@dataclass
+class _CollBuf:
+    """A stable, registered per-role collective buffer.
+
+    ``ptr`` is what the plugin sees; ``nbytes`` is its (grow-only) capacity;
+    ``handle`` is the onecclCommRegister handle. On the dGPU ``keep`` owns the
+    torch device allocation (a uint8 buffer reinterpreted per call); on the
+    iGPU ``keep`` is None and ``ptr`` is plugin USM-host memory.
+    """
+
+    ptr: int
+    nbytes: int
+    handle: int
+    keep: Any = None
+    registered: bool = True
+
+
 class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -154,15 +260,37 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
         if self.world_size != 2:
-            raise NotImplementedError("VLLM_XPU_IGPU_PP currently supports PP=2 only")
+            # The igpu plugin topology is fixed at 2 ranks (1 dGPU + 1 iGPU on
+            # the same host); this holds for both PP=2 and TP=2.
+            raise NotImplementedError(
+                "VLLM_XPU_IGPU currently supports exactly 2 ranks "
+                "(1 dGPU + 1 iGPU), i.e. PP=2 or TP=2 only"
+            )
 
-        # VLLM_XPU_IGPU_PP: load the oneCCL v2 C API. CCL_PLUGIN selects
-        # libccl_igpu.so; do not use torch.distributed send/recv for PP tensors.
-        lib_path = os.getenv("VLLM_XPU_IGPU_PP_LIB", "libccl.so")
+        # VLLM_XPU_IGPU_*: load the oneCCL v2 C API. CCL_PLUGIN selects
+        # libccl_igpu.so; do not use torch.distributed for PP tensors or TP
+        # collectives on the mixed dGPU/iGPU platform.
+        lib_path = os.getenv(
+            "VLLM_XPU_IGPU_LIB", os.getenv("VLLM_XPU_IGPU_PP_LIB", "libccl.so")
+        )
         self.ccl = OneCCL(lib_path)
         self.is_igpu_rank = self.rank_in_group == 1
         self._stream = torch.xpu.current_stream().sycl_queue
-        self._debug = os.getenv("VLLM_XPU_IGPU_PP_DEBUG", "0") == "1"
+        self._debug = os.getenv("VLLM_XPU_IGPU_DEBUG", "0") == "1" or (
+            os.getenv("VLLM_XPU_IGPU_PP_DEBUG", "0") == "1"
+        )
+        # VLLM_XPU_IGPU_TP: grow-only pool of stable, REGISTERED collective
+        # buffers keyed by role ("ar_send"/"ar_recv"/"ag_send"/"ag_recv"), on
+        # BOTH ranks (iGPU: plugin USM-host; dGPU: torch device memory). A role
+        # keeps one buffer whose pointer changes only when it must grow; the
+        # buffer is registered with onecclCommRegister so the plugin runs its
+        # fd handshake once and skips it thereafter (restoring small-message
+        # latency). Grown-out buffers are retired -- deregistered but kept
+        # alive so their address is never recycled into a stale plugin import --
+        # and freed only at destroy. In practice profiling hits the max size
+        # first, so no role grows after its first call.
+        self._coll_bufs: dict[str, _CollBuf] = {}
+        self._retired_bufs: list[_CollBuf] = []
         self._log(
             "init "
             f"rank_in_group={self.rank_in_group} global_rank={self.global_rank} "
@@ -207,7 +335,17 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
             return ONECCL_FLOAT32
         if dtype == torch.bfloat16:
             return ONECCL_BFLOAT16
-        raise NotImplementedError(f"VLLM_XPU_IGPU_PP unsupported dtype: {dtype}")
+        if dtype == torch.float64:
+            return ONECCL_FLOAT64
+        if dtype == torch.int32:
+            return ONECCL_INT32
+        if dtype == torch.int64:
+            return ONECCL_INT64
+        if dtype == torch.int8:
+            return ONECCL_INT8
+        if dtype == torch.uint8:
+            return ONECCL_UINT8
+        raise NotImplementedError(f"VLLM_XPU_IGPU unsupported dtype: {dtype}")
 
     @staticmethod
     def _dtype_name(dtype: torch.dtype) -> str:
@@ -293,6 +431,115 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         finally:
             self._release_prepared(item)
 
+    # --- TP collectives (VLLM_XPU_IGPU_TP) ------------------------------------
+    def _coll_buf(self, role: str, nbytes: int) -> _CollBuf:
+        """Return a stable, registered collective buffer of >= ``nbytes`` bytes.
+
+        Grow-only: the pointer changes only when a larger size is requested, and
+        the previous buffer is deregistered + retired (kept alive) so its address
+        is never recycled. Because both ranks issue the same role/size sequence
+        in lockstep, they grow (and thus re-register / re-handshake) together.
+        """
+        cur = self._coll_bufs.get(role)
+        if cur is not None and cur.nbytes >= nbytes:
+            return cur
+        if cur is not None:
+            self.ccl.comm_deregister(cur.handle)
+            cur.registered = False
+            self._retired_bufs.append(cur)
+        if self.is_igpu_rank:
+            ptr = self.ccl.mem_alloc(nbytes)
+            keep = None
+        else:
+            keep = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            ptr = keep.data_ptr()
+        handle = self.ccl.comm_register(ptr, nbytes)
+        buf = _CollBuf(ptr=ptr, nbytes=nbytes, handle=handle, keep=keep)
+        self._coll_bufs[role] = buf
+        return buf
+
+    def _dev_view(self, buf: _CollBuf, count: int, dtype: torch.dtype) -> torch.Tensor:
+        # Reinterpret the leading bytes of the dGPU uint8 pool buffer as a
+        # 1-D tensor of ``count`` elements of ``dtype`` (data_ptr == buf.ptr).
+        elsize = torch.empty(0, dtype=dtype).element_size()
+        return buf.keep[: count * elsize].view(dtype)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if not input_.is_xpu:
+            raise NotImplementedError("VLLM_XPU_IGPU_TP only supports XPU tensors")
+        input_ = input_.contiguous()
+        ccl_dtype = self._dtype_to_ccl(input_.dtype)
+        count = input_.numel()
+        nbytes = count * input_.element_size()
+        # Fused reduce+broadcast writes both recvbuffs; return a fresh output
+        # rather than reducing in place (the kernel reads peer sendbuff over PCIe
+        # while writing recvbuff, and the pool recv buffer is overwritten by the
+        # next call so it must not be handed to the caller).
+        output = torch.empty_like(input_)
+        sbuf = self._coll_buf("ar_send", nbytes)
+        rbuf = self._coll_buf("ar_recv", nbytes)
+        self._log(f"all_reduce count={count} nbytes={nbytes} igpu={self.is_igpu_rank}")
+
+        if self.is_igpu_rank:
+            self._copy_tensor_to_host_ptr(input_, sbuf.ptr)
+            self.ccl.all_reduce(
+                sbuf.ptr, rbuf.ptr, count, ccl_dtype, ONECCL_SUM, self._stream
+            )
+            torch.xpu.synchronize()
+            self._copy_host_ptr_to_tensor(rbuf.ptr, output)
+        else:
+            self._dev_view(sbuf, count, input_.dtype).copy_(input_.reshape(-1))
+            torch.xpu.synchronize()
+            self.ccl.all_reduce(
+                sbuf.ptr, rbuf.ptr, count, ccl_dtype, ONECCL_SUM, self._stream
+            )
+            torch.xpu.synchronize()
+            output.copy_(self._dev_view(rbuf, count, input_.dtype).reshape(output.shape))
+        return output
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if not input_.is_xpu:
+            raise NotImplementedError("VLLM_XPU_IGPU_TP only supports XPU tensors")
+        if dim < 0:
+            dim += input_.dim()
+        input_ = input_.contiguous()
+        input_size = tuple(input_.size())
+        ccl_dtype = self._dtype_to_ccl(input_.dtype)
+        sendcount = input_.numel()
+        nbytes = sendcount * input_.element_size()
+        total = sendcount * self.world_size
+        self._log(f"all_gather sendcount={sendcount} dim={dim} igpu={self.is_igpu_rank}")
+
+        # Gather rank-major into a flat device tensor, then reshape like the base
+        # communicator (concat-style all-gather, torch.compile compatible).
+        gathered = torch.empty(total, dtype=input_.dtype, device=self.device)
+        sbuf = self._coll_buf("ag_send", nbytes)
+        rbuf = self._coll_buf("ag_recv", nbytes * self.world_size)
+        if self.is_igpu_rank:
+            self._copy_tensor_to_host_ptr(input_, sbuf.ptr)
+            self.ccl.all_gather(sbuf.ptr, rbuf.ptr, sendcount, ccl_dtype, self._stream)
+            torch.xpu.synchronize()
+            self._copy_host_ptr_to_tensor(rbuf.ptr, gathered)
+        else:
+            self._dev_view(sbuf, sendcount, input_.dtype).copy_(input_.reshape(-1))
+            torch.xpu.synchronize()
+            self.ccl.all_gather(sbuf.ptr, rbuf.ptr, sendcount, ccl_dtype, self._stream)
+            torch.xpu.synchronize()
+            gathered.copy_(self._dev_view(rbuf, total, input_.dtype))
+
+        output = gathered.reshape((self.world_size,) + input_size)
+        output = output.movedim(0, dim)
+        output = output.reshape(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
+        return output
+
     def send_tensor_dict(self, tensor_dict: dict[str, torch.Tensor | Any], dst: int) -> None:
         self._log(f"send_tensor_dict keys={list(tensor_dict.keys())} dst={dst}")
         metadata: list[tuple[str, Any]] = []
@@ -371,5 +618,19 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         return result
 
     def destroy(self) -> None:
+        # Deregister live buffers (retired ones already were) and free the iGPU
+        # USM-host allocations; dGPU torch buffers are freed by GC. Both ranks
+        # tear down the same roles in the same order, so this stays symmetric.
+        for buf in list(self._coll_bufs.values()) + self._retired_bufs:
+            if buf.registered:
+                try:
+                    self.ccl.comm_deregister(buf.handle)
+                except OneCCLError:
+                    pass
+                buf.registered = False
+            if buf.keep is None and buf.ptr:
+                self.ccl.mem_free(buf.ptr)
+        self._coll_bufs.clear()
+        self._retired_bufs.clear()
         self.ccl.destroy()
         super().destroy()

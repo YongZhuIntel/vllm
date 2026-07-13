@@ -137,10 +137,14 @@ def xpu_platform_plugin() -> str | None:
         import intel_extension_for_pytorch  # noqa: F401
         import torch
 
-        if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1":
-            # VLLM_XPU_IGPU_PP uses a custom oneCCL C API communicator for PP
-            # tensors. Avoid ordinary XCCL device groups across dGPU/iGPU,
-            # which can fail during Level Zero IPC setup on mixed devices.
+        if (
+            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
+        ):
+            # VLLM_XPU_IGPU_{PP,TP} use a custom oneCCL C API communicator for
+            # PP tensors / TP collectives. Avoid ordinary XCCL device groups
+            # across dGPU/iGPU, which can fail during Level Zero IPC setup on
+            # mixed devices.
             dist_backend = "gloo"
         elif supports_xccl():
             dist_backend = "xccl"
