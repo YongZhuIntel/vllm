@@ -580,14 +580,22 @@ class WorkerProc:
         death_reader, death_writer = context.Pipe(duplex=False)
 
         process_env: dict[str, str] | None = None
-        if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1":
-            masks = os.getenv("VLLM_XPU_IGPU_PP_MASKS", "0,1").split(",")
+        if (
+            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
+        ):
+            # VLLM_XPU_IGPU_MASKS (fallback VLLM_XPU_IGPU_PP_MASKS): ZE_AFFINITY
+            # per local rank; default maps rank 0 -> dGPU, rank 1 -> iGPU.
+            masks = os.getenv(
+                "VLLM_XPU_IGPU_MASKS",
+                os.getenv("VLLM_XPU_IGPU_PP_MASKS", "0,1"),
+            ).split(",")
             if local_rank >= len(masks):
                 raise RuntimeError(
-                    "VLLM_XPU_IGPU_PP_MASKS does not cover "
+                    "VLLM_XPU_IGPU_MASKS does not cover "
                     f"local_rank={local_rank}: {masks}"
                 )
-            # VLLM_XPU_IGPU_PP: set per-worker XPU affinity before torch.xpu
+            # VLLM_XPU_IGPU_{PP,TP}: set per-worker XPU affinity before torch.xpu
             # initializes. The parent temporarily applies this env for spawn,
             # and worker_main applies it again before WorkerProc construction.
             process_env = {

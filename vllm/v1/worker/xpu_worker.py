@@ -173,11 +173,13 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            # VLLM_XPU_IGPU_PP: each worker is masked to one physical XPU, so
-            # both PP ranks must use the process-local xpu:0 device.
-            self.device_index = (
-                0 if os.getenv("VLLM_XPU_IGPU_PP", "0") == "1" else self.local_rank
+            # VLLM_XPU_IGPU_{PP,TP}: each worker is masked to one physical XPU,
+            # so both ranks must use the process-local xpu:0 device.
+            igpu = (
+                os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+                or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
             )
+            self.device_index = 0 if igpu else self.local_rank
             self.device = torch.device(f"xpu:{self.device_index}")
             current_platform.set_device(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -204,7 +206,11 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
-        if os.getenv("VLLM_XPU_IGPU_PP", "0") != "1":
+        igpu_mode = (
+            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
+            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
+        )
+        if not igpu_mode:
             # global all_reduce needed for overall oneccl warm up
             torch.distributed.all_reduce(
                 torch.zeros(1).xpu(), group=get_world_group().device_group
