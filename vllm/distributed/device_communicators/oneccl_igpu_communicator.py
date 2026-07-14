@@ -285,7 +285,7 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         # the original per-op path (fresh USM-host alloc / raw tensor ptr) that
         # re-handshakes every hop. TP always registers; this makes PP match when
         # enabled.
-        self._pp_register = os.getenv("VLLM_XPU_IGPU_PP_REGISTER", "0") == "1"
+        self._pp_register = os.getenv("VLLM_XPU_IGPU_PP_REGISTER", "1") == "1"
         # VLLM_XPU_IGPU_TP_REGISTER: gate the registered fast path for TP
         # collectives (default ON). When "1", the _coll_buf pool registers its
         # buffers with onecclCommRegister so the plugin runs its fd handshake
