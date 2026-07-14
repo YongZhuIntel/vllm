@@ -279,6 +279,13 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         self._debug = os.getenv("VLLM_XPU_IGPU_DEBUG", "0") == "1" or (
             os.getenv("VLLM_XPU_IGPU_PP_DEBUG", "0") == "1"
         )
+        # VLLM_XPU_IGPU_PP_REGISTER: opt-in to routing PP send/recv through the
+        # stable, REGISTERED _coll_buf pool so the plugin does its pt2pt fd
+        # handshake once per buffer and skips it thereafter. Default off keeps
+        # the original per-op path (fresh USM-host alloc / raw tensor ptr) that
+        # re-handshakes every hop. TP always registers; this makes PP match when
+        # enabled.
+        self._pp_register = os.getenv("VLLM_XPU_IGPU_PP_REGISTER", "0") == "1"
         # VLLM_XPU_IGPU_TP: grow-only pool of stable, REGISTERED collective
         # buffers keyed by role ("ar_send"/"ar_recv"/"ag_send"/"ag_recv"), on
         # BOTH ranks (iGPU: plugin USM-host; dGPU: torch device memory). A role
@@ -404,11 +411,38 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         return _PreparedTensor(tensor, tensor.data_ptr(), count, ccl_dtype, nbytes)
 
     def _send_packed(self, packed: torch.Tensor, dst: int) -> None:
+        # Registered fast path (VLLM_XPU_IGPU_PP_REGISTER=1): send from a stable,
+        # REGISTERED per-role buffer (the same _coll_buf pool TP uses) so the
+        # plugin runs its pt2pt fd handshake once and skips it on every later hop
+        # (p2p.cpp registered fast path). Both ranks route matching hops through
+        # registered buffers (sender's pp_send, receiver's pp_recv), so the skip
+        # stays symmetric and the paired kvs_sendrecv never desyncs.
+        if self._pp_register:
+            packed = packed.contiguous()
+            ccl_dtype = self._dtype_to_ccl(packed.dtype)
+            count = packed.numel()
+            nbytes = count * packed.element_size()
+            sbuf = self._coll_buf("pp_send", nbytes)
+            self._log(
+                f"send packed count={count} nbytes={nbytes} dst={dst} "
+                f"ptr=0x{sbuf.ptr:x} reg=1"
+            )
+            if self.is_igpu_rank:
+                self._copy_tensor_to_host_ptr(packed, sbuf.ptr)
+            else:
+                self._dev_view(sbuf, count, packed.dtype).copy_(packed.reshape(-1))
+                torch.xpu.synchronize()
+            self.ccl.send(sbuf.ptr, count, ccl_dtype, dst, self._stream)
+            torch.xpu.synchronize()
+            return
+
+        # Default per-op path: fresh USM-host alloc (iGPU) / raw tensor ptr
+        # (dGPU); re-does the handshake every hop.
         item = self._prepare_send_tensor(packed)
         try:
             self._log(
                 f"send packed count={item.count} nbytes={item.nbytes} "
-                f"dst={dst} ptr=0x{item.ptr:x}"
+                f"dst={dst} ptr=0x{item.ptr:x} reg=0"
             )
             torch.xpu.synchronize()
             self.ccl.send(item.ptr, item.count, item.ccl_dtype, dst, self._stream)
@@ -417,11 +451,32 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
             self._release_prepared(item)
 
     def _recv_packed(self, out: torch.Tensor, src: int) -> None:
+        # Registered fast path (VLLM_XPU_IGPU_PP_REGISTER=1): mirror of
+        # _send_packed -- receive into the stable, registered pp_recv buffer,
+        # then copy out into the caller's tensor.
+        if self._pp_register:
+            ccl_dtype = self._dtype_to_ccl(out.dtype)
+            count = out.numel()
+            nbytes = count * out.element_size()
+            rbuf = self._coll_buf("pp_recv", nbytes)
+            self._log(
+                f"recv packed count={count} nbytes={nbytes} src={src} "
+                f"ptr=0x{rbuf.ptr:x} reg=1"
+            )
+            self.ccl.recv(rbuf.ptr, count, ccl_dtype, src, self._stream)
+            torch.xpu.synchronize()
+            if self.is_igpu_rank:
+                self._copy_host_ptr_to_tensor(rbuf.ptr, out)
+            else:
+                out.copy_(self._dev_view(rbuf, count, out.dtype).reshape(out.shape))
+            return
+
+        # Default per-op path.
         item = self._prepare_recv_tensor((out.numel(),), out.dtype)
         try:
             self._log(
                 f"recv packed count={item.count} nbytes={item.nbytes} "
-                f"src={src} ptr=0x{item.ptr:x}"
+                f"src={src} ptr=0x{item.ptr:x} reg=0"
             )
             self.ccl.recv(item.ptr, item.count, item.ccl_dtype, src, self._stream)
             torch.xpu.synchronize()
