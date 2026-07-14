@@ -286,16 +286,25 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         # re-handshakes every hop. TP always registers; this makes PP match when
         # enabled.
         self._pp_register = os.getenv("VLLM_XPU_IGPU_PP_REGISTER", "0") == "1"
-        # VLLM_XPU_IGPU_TP: grow-only pool of stable, REGISTERED collective
-        # buffers keyed by role ("ar_send"/"ar_recv"/"ag_send"/"ag_recv"), on
-        # BOTH ranks (iGPU: plugin USM-host; dGPU: torch device memory). A role
-        # keeps one buffer whose pointer changes only when it must grow; the
-        # buffer is registered with onecclCommRegister so the plugin runs its
-        # fd handshake once and skips it thereafter (restoring small-message
-        # latency). Grown-out buffers are retired -- deregistered but kept
-        # alive so their address is never recycled into a stale plugin import --
-        # and freed only at destroy. In practice profiling hits the max size
-        # first, so no role grows after its first call.
+        # VLLM_XPU_IGPU_TP_REGISTER: gate the registered fast path for TP
+        # collectives (default ON). When "1", the _coll_buf pool registers its
+        # buffers with onecclCommRegister so the plugin runs its fd handshake
+        # once per buffer and skips it thereafter (small-message latency). Set
+        # "0" to keep the stable pool but skip registration -- the plugin then
+        # always re-exchanges (the correct-but-slower always-exchange path),
+        # useful for debugging or isolating the fast path.
+        self._tp_register = os.getenv("VLLM_XPU_IGPU_TP_REGISTER", "1") == "1"
+        # VLLM_XPU_IGPU_TP: grow-only pool of stable collective buffers keyed by
+        # role ("ar_send"/"ar_recv"/"ag_send"/"ag_recv"), on BOTH ranks (iGPU:
+        # plugin USM-host; dGPU: torch device memory). A role keeps one buffer
+        # whose pointer changes only when it must grow; when registration is on
+        # (see _tp_register) the buffer is registered with onecclCommRegister so
+        # the plugin runs its fd handshake once and skips it thereafter
+        # (restoring small-message latency). Grown-out buffers are retired --
+        # deregistered (if registered) but kept alive so their address is never
+        # recycled into a stale plugin import -- and freed only at destroy. In
+        # practice profiling hits the max size first, so no role grows after its
+        # first call.
         self._coll_bufs: dict[str, _CollBuf] = {}
         self._retired_bufs: list[_CollBuf] = []
         self._log(
@@ -487,20 +496,24 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
             self._release_prepared(item)
 
     # --- TP collectives (VLLM_XPU_IGPU_TP) ------------------------------------
-    def _coll_buf(self, role: str, nbytes: int) -> _CollBuf:
-        """Return a stable, registered collective buffer of >= ``nbytes`` bytes.
+    def _coll_buf(self, role: str, nbytes: int, register: bool = True) -> _CollBuf:
+        """Return a stable collective buffer of >= ``nbytes`` bytes.
 
         Grow-only: the pointer changes only when a larger size is requested, and
-        the previous buffer is deregistered + retired (kept alive) so its address
-        is never recycled. Because both ranks issue the same role/size sequence
-        in lockstep, they grow (and thus re-register / re-handshake) together.
+        the previous buffer is deregistered (if it was registered) + retired
+        (kept alive) so its address is never recycled. Because both ranks issue
+        the same role/size sequence in lockstep, they grow (and thus
+        re-register / re-handshake) together. When ``register`` is False the
+        buffer is not registered with the plugin, so the plugin always
+        re-exchanges for it.
         """
         cur = self._coll_bufs.get(role)
         if cur is not None and cur.nbytes >= nbytes:
             return cur
         if cur is not None:
-            self.ccl.comm_deregister(cur.handle)
-            cur.registered = False
+            if cur.registered:
+                self.ccl.comm_deregister(cur.handle)
+                cur.registered = False
             self._retired_bufs.append(cur)
         if self.is_igpu_rank:
             ptr = self.ccl.mem_alloc(nbytes)
@@ -508,8 +521,10 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         else:
             keep = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
             ptr = keep.data_ptr()
-        handle = self.ccl.comm_register(ptr, nbytes)
-        buf = _CollBuf(ptr=ptr, nbytes=nbytes, handle=handle, keep=keep)
+        handle = self.ccl.comm_register(ptr, nbytes) if register else 0
+        buf = _CollBuf(
+            ptr=ptr, nbytes=nbytes, handle=handle, keep=keep, registered=register
+        )
         self._coll_bufs[role] = buf
         return buf
 
@@ -533,8 +548,8 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         # while writing recvbuff, and the pool recv buffer is overwritten by the
         # next call so it must not be handed to the caller).
         output = torch.empty_like(input_)
-        sbuf = self._coll_buf("ar_send", nbytes)
-        rbuf = self._coll_buf("ar_recv", nbytes)
+        sbuf = self._coll_buf("ar_send", nbytes, self._tp_register)
+        rbuf = self._coll_buf("ar_recv", nbytes, self._tp_register)
         self._log(f"all_reduce count={count} nbytes={nbytes} igpu={self.is_igpu_rank}")
 
         if self.is_igpu_rank:
@@ -572,8 +587,8 @@ class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
         # Gather rank-major into a flat device tensor, then reshape like the base
         # communicator (concat-style all-gather, torch.compile compatible).
         gathered = torch.empty(total, dtype=input_.dtype, device=self.device)
-        sbuf = self._coll_buf("ag_send", nbytes)
-        rbuf = self._coll_buf("ag_recv", nbytes * self.world_size)
+        sbuf = self._coll_buf("ag_send", nbytes, self._tp_register)
+        rbuf = self._coll_buf("ag_recv", nbytes * self.world_size, self._tp_register)
         if self.is_igpu_rank:
             self._copy_tensor_to_host_ptr(input_, sbuf.ptr)
             self.ccl.all_gather(sbuf.ptr, rbuf.ptr, sendcount, ccl_dtype, self._stream)
