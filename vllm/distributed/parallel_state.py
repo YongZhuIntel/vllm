@@ -115,6 +115,21 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _should_skip_tp_pp(group_name: str) -> bool:
+    """Whether TP/PP communication should be skipped for perf profiling.
+
+    Controlled by ``VLLM_SKIP_TP_PP``. When enabled, TP collectives and PP
+    tensor transfers on the "tp"/"pp" groups return shape-correct stand-ins
+    instead of exchanging data, so the model runs end-to-end (results are
+    numerically invalid) and the communication share of latency can be
+    measured. The skip lives above ``device_communicator`` dispatch, so it
+    covers both the igpu and non-igpu backends.
+    """
+    return envs.VLLM_SKIP_TP_PP and (
+        group_name.startswith("tp") or group_name.startswith("pp")
+    )
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -511,6 +526,12 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the actual all-reduce; the summed result has the same shape
+            # as the input, so returning the input unchanged keeps the model
+            # running for communication-overhead profiling.
+            return input_
+
         if self.use_custom_op_call:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
@@ -530,6 +551,11 @@ class GroupCoordinator:
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
 
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the actual all-gather; replicate this rank's input across the
+            # group so the output shape matches (concat of world_size inputs).
+            return torch.cat([input_] * world_size, dim=dim)
+
         if self.use_custom_op_call:
             return torch.ops.vllm.all_gather(
                 input_, dim, world_size, group_name=self.unique_name
@@ -548,6 +574,18 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        if _should_skip_tp_pp(self.unique_name) and isinstance(input_, torch.Tensor):
+            # Skip the actual all-gather; return a shape-correct zero tensor
+            # whose gathered dim length is sum(sizes) (or world_size * local
+            # length when sizes is not given). The list-input form is left on
+            # the real path (rare, not on the hot TP path).
+            d = dim if dim >= 0 else dim + input_.dim()
+            out_shape = list(input_.shape)
+            out_shape[d] = (
+                sum(sizes) if sizes is not None else input_.shape[d] * self.world_size
+            )
+            return torch.zeros(out_shape, dtype=input_.dtype, device=input_.device)
+
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
@@ -561,6 +599,15 @@ class GroupCoordinator:
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
 
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the actual reduce-scatter; return this rank's contiguous
+            # shard so the output shape matches.
+            d = dim if dim >= 0 else dim + input_.dim()
+            input_tensor = input_.movedim(d, 0).contiguous()
+            assert input_tensor.shape[0] % world_size == 0
+            shard = input_tensor.chunk(world_size, dim=0)[self.rank_in_group]
+            return shard.movedim(0, d).contiguous()
+
         if self.use_custom_op_call:
             return torch.ops.vllm.reduce_scatter(
                 input_, dim, world_size, group_name=self.unique_name
@@ -571,6 +618,20 @@ class GroupCoordinator:
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the actual reduce-scatter; return this rank's shard (honoring
+            # variable `sizes` when provided) so the output shape matches.
+            d = dim if dim >= 0 else dim + input_.dim()
+            input_tensor = input_.movedim(d, 0).contiguous()
+            if sizes is not None:
+                assert len(sizes) == self.world_size
+                assert input_tensor.shape[0] == sum(sizes)
+                shard = input_tensor.split(sizes, dim=0)[self.rank_in_group]
+            else:
+                assert input_tensor.shape[0] % self.world_size == 0
+                shard = input_tensor.chunk(self.world_size, dim=0)[self.rank_in_group]
+            return shard.movedim(0, d).contiguous()
+
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatterv(input_, dim, sizes)
@@ -837,6 +898,16 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the heavy per-tensor sends; still exchange the cheap metadata
+            # (shapes/dtypes) so the receiver can allocate matching tensors.
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
+            metadata_list, _ = _split_tensor_dict(tensor_dict)
+            self.send_object(metadata_list, dst=dst)
+            return None
+
         if self.use_cpu_custom_send_recv:
             if self.device_communicator is None:
                 raise ValueError("No device communicator found")
@@ -935,6 +1006,21 @@ class GroupCoordinator:
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if _should_skip_tp_pp(self.unique_name):
+            # Skip the heavy per-tensor recvs; read the metadata and materialize
+            # zero tensors with matching shape/dtype/device so the pipeline stays
+            # shape-consistent and runs to completion.
+            recv_metadata_list = self.recv_object(src=src)
+            tensor_dict: dict[str, Any] = {}
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor_dict[key] = torch.zeros(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                else:
+                    tensor_dict[key] = value
+            return tensor_dict
 
         if self.use_cpu_custom_send_recv:
             if self.device_communicator is None:

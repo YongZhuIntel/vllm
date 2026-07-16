@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
+    VLLM_SKIP_TP_PP: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
@@ -939,6 +940,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Unified switch to skip TP collectives and PP tensor send/recv for
+    # communication-overhead profiling. When "1", TP collectives (all_reduce,
+    # all_gather(v), reduce_scatter(v)) and PP tensor transfers on the "tp"/"pp"
+    # groups return shape-correct stand-ins instead of exchanging data. PP still
+    # exchanges the cheap metadata and materializes zero-valued tensors with
+    # matching shapes/dtypes at the receiver, so the model runs end-to-end
+    # (results are numerically invalid). The skip lives above the device
+    # communicator dispatch, so it covers both the igpu and non-igpu backends.
+    "VLLM_SKIP_TP_PP": lambda: os.getenv("VLLM_SKIP_TP_PP", "0") == "1",
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
