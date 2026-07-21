@@ -214,6 +214,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 use_prepack=True,
                 experts_start_id=ep_rank_start,
             )
+            # prefill 冷专家 iGPU 卸载(VLLM_XPU_IGPU_MOE):额外建 hot 模块 +
+            # 把冷专家权重注册到 iGPU sidecar。原 ipex_fusion 保留给 decode/关闭态。
+            self._maybe_setup_igpu_moe_offload(layer, ipex)
         elif current_platform.is_cpu():
             from vllm.model_executor.layers.fused_moe import cpu_fused_moe
 
@@ -285,6 +288,74 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     TritonExperts(self.moe_quant_config),
                     shared_experts=None,
                 )
+
+    def _maybe_setup_igpu_moe_offload(self, layer, ipex) -> None:
+        """VLLM_XPU_IGPU_MOE 开启时:建 hot 模块(experts [0,E-K))并把冷专家
+        experts [E-K,E) 注册到 iGPU sidecar。见 igpu_moe_offload.py 说明。"""
+        from vllm.model_executor.layers.fused_moe import igpu_moe_offload as igmo
+
+        layer._igpu_moe_ok = False
+        if not igmo.moe_offload_enabled():
+            return
+        # 冷 sidecar 无法复刻自定义路由 / 分数修正 → 与 ipex 全路径不等价,回退。
+        if (getattr(layer, "custom_routing_function", None) is not None
+                or getattr(layer, "e_score_correction_bias", None) is not None):
+            logger.warning("VLLM_XPU_IGPU_MOE: custom routing / score-bias layer; "
+                           "offload disabled for this layer.")
+            return
+
+        w13, w2 = layer.w13_weight, layer.w2_weight
+        E = w13.shape[0]
+        if E < 2:
+            return
+        K = igmo.resolve_offload_k(E)
+        H, I, w13_up = w2.shape[1], w2.shape[2], w13.shape[1]
+
+        lid = getattr(type(self), "_igpu_moe_layer_counter", 0)
+        type(self)._igpu_moe_layer_counter = lid + 1
+
+        # hot 模块:experts [0, E-K),独立 clone(prepack 禁 view)。
+        layer.ipex_hot = ipex.llm.modules.GatedMLPMOE(
+            w13[: E - K].clone().contiguous(),
+            w2[: E - K].clone().contiguous(),
+            use_prepack=True,
+            experts_start_id=0,
+        )
+
+        def _cfg_factory():
+            from vllm.config import get_current_vllm_config
+
+            vc = get_current_vllm_config()
+            max_tok = int(vc.scheduler_config.max_num_batched_tokens)
+            return igmo.OffloadCfg(
+                hidden=H, inter=I, w13_up=w13_up, global_experts=E, offload_k=K,
+                top_k=layer.top_k, renormalize=bool(layer.renormalize),
+                use_grouped_topk=bool(layer.use_grouped_topk),
+                topk_group=layer.topk_group, num_expert_group=layer.num_expert_group,
+                scoring_func=getattr(layer, "scoring_func", "softmax"),
+                max_tokens=max_tok, mask=igmo.moe_offload_mask(),
+                debug=igmo.moe_offload_debug(),
+                ctrl_name="", in_name="", out_name="", logits_name="")
+
+        sidecar = igmo.IGpuMoeSidecar.get(_cfg_factory)
+        # 同构性检查:sidecar cfg 按首层建;异构层回退,避免 shm 尺寸/形状错配。
+        sc = sidecar.cfg
+        if (sc.global_experts, sc.hidden, sc.inter, sc.w13_up, sc.offload_k) != (
+                E, H, I, w13_up, K):
+            logger.warning("VLLM_XPU_IGPU_MOE: heterogeneous MoE layer "
+                           "(E=%d H=%d I=%d K=%d); offload disabled here.",
+                           E, H, I, K)
+            return
+        ok = sidecar.register_layer(
+            lid,
+            w13[E - K: E].to("cpu").clone().contiguous(),
+            w2[E - K: E].to("cpu").clone().contiguous(),
+        )
+        layer._igpu_moe_lid = lid
+        layer._igpu_moe_ok = bool(ok and sidecar.ready)
+        if igmo.moe_offload_debug():
+            logger.info("VLLM_XPU_IGPU_MOE: layer %d E=%d K=%d hot=%d ok=%s",
+                        lid, E, K, E - K, layer._igpu_moe_ok)
 
     def apply(
         self,
@@ -384,6 +455,35 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             or layer.logical_replica_count is not None
         ):
             raise NotImplementedError("Expert load balancing is not supported for XPU.")
+
+        # prefill 冷专家 iGPU 卸载:dGPU 算 hot(E-K)‖ iGPU sidecar 算 cold(K),相加。
+        # 仅 prefill(token 数 >= 阈值);decode / 关闭 / 未就绪 / 失败 → 走原完整 ipex。
+        if getattr(layer, "_igpu_moe_ok", False):
+            from vllm.model_executor.layers.fused_moe import igpu_moe_offload as igmo
+
+            if x.shape[0] >= igmo.moe_offload_min_tokens():
+                sidecar = igmo.IGpuMoeSidecar._instance
+                if sidecar is not None and sidecar.ready and sidecar.is_registered(
+                        layer._igpu_moe_lid):
+                    try:
+                        seq = sidecar.send(layer._igpu_moe_lid, x, router_logits)
+                        # dGPU hot(async 提交)与 iGPU cold 并行
+                        hot = layer.ipex_hot(
+                            x,
+                            layer.use_grouped_topk,
+                            layer.top_k,
+                            router_logits,
+                            layer.renormalize,
+                            layer.topk_group,
+                            layer.num_expert_group,
+                            custom_routing_function=layer.custom_routing_function,
+                        )
+                        cold = sidecar.wait(seq, hot.device)
+                        return hot + cold
+                    except Exception as e:  # noqa: BLE001 —— 回退原路径,保证不挂
+                        logger.warning("VLLM_XPU_IGPU_MOE offload failed (%s); "
+                                       "falling back to full ipex.", e)
+
         return layer.ipex_fusion(
             x,
             layer.use_grouped_topk,
