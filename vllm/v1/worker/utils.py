@@ -87,23 +87,29 @@ class KVBlockZeroer:
 
     def __init__(
         self,
-        kv_caches: list[torch.Tensor],
+        kv_caches: dict[str, torch.Tensor],
         kv_cache_config: KVCacheConfig,
         backend: type[AttentionBackend],
         kernel_block_sizes: list[int] | list[int | None],
     ) -> None:
-        # Collect per-group segment addresses and page sizes.
+        # Collect per-layer segment addresses and page sizes. Each attention
+        # layer owns its own buffer, so every layer of every attention group
+        # needs its own segment(s). Note that `kv_caches` must be keyed by
+        # layer name: the runner's `kv_caches` list is ordered by layer index,
+        # so indexing it by kv cache group id would pick an unrelated (and for
+        # hybrid models possibly non-attention) buffer.
         seg_addrs: list[int] = []
         page_sizes_el: list[int] = []
         block_dim: int | None = None
         block_dim_resolved = False
+        ref_buf: torch.Tensor | None = None
+        seen_ptrs: set[int] = set()
 
         for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
             if not isinstance(spec, (FullAttentionSpec, EncoderOnlyAttentionSpec)):
                 continue
 
-            buf = kv_caches[group_idx]
             kbs = kernel_block_sizes[group_idx]
             num_kv_heads = spec.num_kv_heads
             head_size = spec.head_size
@@ -115,41 +121,59 @@ class KVBlockZeroer:
                     block_size, num_kv_heads, head_size)
                 block_dim_resolved = True
 
-            if block_dim is None or block_dim == 0:
-                # Shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
-                page_el = 2 * block_size * num_kv_heads * head_size
-                seg_addrs.append(buf.data_ptr())
-                page_sizes_el.append(page_el)
-            else:
-                # Shape: [2, num_blocks, block_size, num_kv_heads, head_size]
-                page_el = block_size * num_kv_heads * head_size
-                for kv_idx in range(2):
-                    seg_addrs.append(buf[kv_idx].data_ptr())
+            for layer_name in group.layer_names:
+                buf = kv_caches.get(layer_name)
+                if buf is None:
+                    # Padding layer, or a layer that lives on another
+                    # pipeline-parallel rank.
+                    continue
+                assert isinstance(buf, torch.Tensor), (
+                    f"Attention layer {layer_name} has a non-tensor KV cache "
+                    f"of type {type(buf)}"
+                )
+                # Layers sharing their KV cache point at the same storage;
+                # register it once.
+                if buf.data_ptr() in seen_ptrs:
+                    continue
+                seen_ptrs.add(buf.data_ptr())
+                ref_buf = buf
+
+                if block_dim is None or block_dim == 0:
+                    # Shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
+                    page_el = 2 * block_size * num_kv_heads * head_size
+                    seg_addrs.append(buf.data_ptr())
                     page_sizes_el.append(page_el)
+                else:
+                    # Shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+                    page_el = block_size * num_kv_heads * head_size
+                    for kv_idx in range(2):
+                        seg_addrs.append(buf[kv_idx].data_ptr())
+                        page_sizes_el.append(page_el)
 
         if not seg_addrs:
             self._seg_addrs_t: torch.Tensor | None = None
             return
 
+        assert ref_buf is not None
         page_size_el = page_sizes_el[0]
         assert all(p == page_size_el for p in page_sizes_el), (
             "All attention groups must have the same page size in elements"
         )
 
         # Convert to int32 element count (kernel writes int32).
-        assert (buf.element_size() * page_size_el) % 4 == 0
-        page_size_int32 = (buf.element_size() * page_size_el) // 4
+        assert (ref_buf.element_size() * page_size_el) % 4 == 0
+        page_size_int32 = (ref_buf.element_size() * page_size_el) // 4
         block_size_triton = largest_power_of_2_divisor(page_size_int32)
 
         self._seg_addrs_t = torch.tensor(
-            seg_addrs, dtype=torch.uint64, device=buf.device
+            seg_addrs, dtype=torch.uint64, device=ref_buf.device
         )
         self._n_segs = len(seg_addrs)
         self._page_size_int32 = page_size_int32
         self._block_size_triton = block_size_triton
         self._max_block_ids = 512
         self._block_ids_buf = torch.empty(
-            self._max_block_ids, dtype=torch.int32, device=buf.device
+            self._max_block_ids, dtype=torch.int32, device=ref_buf.device
         )
 
     # ------------------------------------------------------------------

@@ -843,13 +843,55 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _kv_caches_by_layer(self) -> dict[str, torch.Tensor]:
+        """Map layer name -> its KV cache, as bound by `bind_kv_cache`.
+
+        The runner's `self.kv_caches` list is ordered by layer index and must
+        not be indexed by kv cache group id; for hybrid models the two index
+        spaces disagree and the mismatch silently picks the wrong buffer.
+        """
+        kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, layer in self.compilation_config.static_forward_context.items():
+            kv_cache = getattr(layer, "kv_cache", None)
+            if not kv_cache:
+                continue
+            # NOTE: kv_cache is a list because of v0 PP virtual engine.
+            buf = kv_cache[0]
+            if isinstance(buf, torch.Tensor) and buf.numel() == 0:
+                # Unbound placeholder (e.g. a layer without a KV cache).
+                continue
+            kv_caches[layer_name] = buf
+        return kv_caches
+
     def _init_kv_zero_meta(self) -> None:
         """One-time precomputation for _zero_block_ids.
 
         Constructs a KVBlockZeroer with the runner's KV cache tensors,
-        config, attention backend, and kernel block sizes.
+        config, attention backend, and kernel block sizes, and collects the
+        Mamba state tensors that must be zeroed alongside them.
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        kv_caches = self._kv_caches_by_layer()
+
+        # Mamba/GDN state blocks are not handled by KVBlockZeroer (it only
+        # handles FullAttentionSpec), so collect their state tensors here to
+        # prevent stale data from corrupting conv_state/ssm_state.
+        mamba_states: list[torch.Tensor] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            for layer_name in group.layer_names:
+                kv_cache = kv_caches.get(layer_name)
+                if kv_cache is None:
+                    continue
+                # Mamba kv_cache is a list of state tensors
+                # [conv_state, ssm_state].
+                if isinstance(kv_cache, (list, tuple)):
+                    mamba_states.extend(kv_cache)
+                else:
+                    mamba_states.append(kv_cache)
+        self._mamba_state_tensors = mamba_states
+
         # Find the attention backend from a non-Mamba attention group.
         # Mamba backends do not implement get_kv_cache_shape, so we must
         # use an attention backend (any AttentionSpec subclass).
@@ -859,9 +901,9 @@ class GPUModelRunner(
                 backend = attn_group.backend
                 break
         if backend is None:
-            return  # No standard attention groups → nothing to zero.
+            return  # No standard attention groups → nothing more to zero.
         self._kv_block_zeroer = KVBlockZeroer(
-            kv_caches=self.kv_caches,
+            kv_caches=kv_caches,
             kv_cache_config=self.kv_cache_config,
             backend=backend,
             kernel_block_sizes=self._kernel_block_sizes,
@@ -870,18 +912,10 @@ class GPUModelRunner(
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero(block_ids)
-        # Also zero Mamba/GDN state blocks — KVBlockZeroer only handles
-        # FullAttentionSpec, so MambaSpec blocks must be zeroed separately
-        # to prevent stale data from corrupting conv_state/ssm_state.
-        for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if isinstance(group.kv_cache_spec, MambaSpec):
-                kv_cache = self.kv_caches[group_idx]
-                # Mamba kv_cache is a list of state tensors [conv_state, ssm_state]
-                state_list = kv_cache if isinstance(kv_cache, list) else [kv_cache]
-                for state_tensor in state_list:
-                    for bid in block_ids:
-                        if bid < state_tensor.shape[0]:
-                            state_tensor[bid].zero_()
+        for state_tensor in getattr(self, "_mamba_state_tensors", ()):
+            for bid in block_ids:
+                if bid < state_tensor.shape[0]:
+                    state_tensor[bid].zero_()
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
