@@ -24,6 +24,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -208,7 +209,10 @@ class InternParallelAttention(nn.Module):
         )
 
         self.attn = MMEncoderAttention(
-            self.num_heads_per_partition, self.head_dim, self.scale
+            self.num_heads_per_partition,
+            self.head_dim,
+            self.scale,
+            attn_backend_override=AttentionBackendEnum.IPEX,
         )
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):

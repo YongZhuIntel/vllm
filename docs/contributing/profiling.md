@@ -13,7 +13,11 @@ when launching the server, and setting the entries `profiler` to `'torch'` and `
 - `torch_profiler_with_stack` to enable recording stack information, on by default
 - `torch_profiler_with_flops` to enable recording FLOPs, off by default
 - `torch_profiler_use_gzip` to control gzip-compressing profiling files, on by default
+- `torch_profiler_save_traces` to control whether trace json files are written, on by default
 - `torch_profiler_dump_cuda_time_total` to control dumping and printing the aggregated CUDA self time table, on by default
+
+If you only want the aggregated `profiler_out_<rank>.txt` outputs and do not
+want the large trace json files, set `torch_profiler_save_traces` to `false`.
 
 When using `vllm bench serve`, you can enable profiling by passing the `--profile` flag.
 
@@ -40,6 +44,9 @@ Refer to [examples/offline_inference/simple_profiling.py](../../examples/offline
 
 ```bash
 vllm serve meta-llama/Llama-3.1-8B-Instruct --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile"}'
+
+# Only dump profiler_out_<rank>.txt, do not save trace json files.
+vllm serve meta-llama/Llama-3.1-8B-Instruct --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_save_traces": false}'
 ```
 
 vllm bench command:

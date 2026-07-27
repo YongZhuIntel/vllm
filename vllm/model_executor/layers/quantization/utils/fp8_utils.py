@@ -1216,6 +1216,16 @@ def w8a8_triton_block_scaled_mm(
             "num_stages": 2,
         }
 
+        if current_platform.is_xpu():
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": block_size[0]//2,
+                "BLOCK_SIZE_K": block_size[1]//2,
+                "GROUP_SIZE_M": 32,
+                "num_warps": 8,
+                "num_stages": 2,
+            }
+
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -1576,7 +1586,9 @@ def process_fp8_weight_block_strategy(
         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale
         )
-
+    if current_platform.is_xpu():
+        if weight.dtype != current_platform.fp8_dtype():
+            weight = weight.to(torch.float32).to(current_platform.fp8_dtype())
     weight = _maybe_pad_fp8_weight(weight)
     return weight, weight_scale
 

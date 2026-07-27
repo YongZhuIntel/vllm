@@ -5,7 +5,12 @@ from collections import deque
 import numpy as np
 import torch
 
-from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
+
+if current_platform.is_cuda_alike():
+    from vllm import _custom_ops as ops
+elif current_platform.is_xpu():
+    from vllm._ipex_ops import ipex_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
@@ -94,7 +99,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.dst_block_size_factor: int = dst_block_size_factor
 
         assert len(src_tensors) > 0
-        self.gpu_to_cpu: bool = self.src_tensors[0].is_cuda
+        self.gpu_to_cpu: bool = (
+            self.src_tensors[0].is_cuda or self.src_tensors[0].is_xpu
+        )
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}

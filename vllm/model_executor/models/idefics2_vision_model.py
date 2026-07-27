@@ -30,6 +30,7 @@ from transformers.models.idefics2.configuration_idefics2 import (
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -161,9 +162,12 @@ class Idefics2VisionAttention(nn.Module):
             prefix=f"{prefix}.out_proj",
             disable_tp=use_data_parallel,
         )
-        # Use unified MMEncoderAttention with Flash Attention support
+        # Use unified MMEncoderAttention with IPEX support for XPU
         self.attn = MMEncoderAttention(
-            self.num_heads_per_partition, self.head_dim, self.scale
+            self.num_heads_per_partition,
+            self.head_dim,
+            self.scale,
+            attn_backend_override=AttentionBackendEnum.IPEX,
         )
 
     def forward(
@@ -176,7 +180,15 @@ class Idefics2VisionAttention(nn.Module):
         query_states, key_states, value_states = qkv.chunk(3, dim=-1)
 
         # Use unified MMEncoderAttention implementation
-        out = self.attn(query_states, key_states, value_states)
+        # add cu_seqlens and max_seqlen for variable-length attention support
+        bsz, q_len, _ = query_states.size()
+        tmp = [0]
+        for i in range(bsz):
+            tmp.append(q_len)
+        seqlen = torch.tensor(tmp)
+        cu_seqlens = torch.cumsum(seqlen, dim=0).to(device=query_states.device)
+        max_seqlen = q_len
+        out = self.attn(query_states, key_states, value_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         attn_output, _ = self.out_proj(out)
         return attn_output
 

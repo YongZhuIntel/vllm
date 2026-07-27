@@ -32,36 +32,23 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning content from the model output.
-
-        Qwen3 has stricter requirements - it needs both start and end tokens
-        to be present, unlike other models that work with just the end token.
-
-        For text <think>abc</think>xyz:
-        - 'abc' goes to reasoning
-        - 'xyz' goes to content
-
-        Returns:
-            tuple[Optional[str], Optional[str]]: reasoning content and content
+ 
+        Handles both cases:
+        - <think>abc</think>xyz (start token in output)
+        - abc</think>xyz (start token was in prompt, not in generated output)
         """
-
-        # Check if the model output contains both <think> and </think> tokens.
-        if self.start_token not in model_output or self.end_token not in model_output:
+ 
+        if self.end_token not in model_output:
+            if self.start_token in model_output:
+                _, _, after = model_output.partition(self.start_token)
+                return after or None, None
             return None, model_output
-
-        # Check if the <think> is present in the model output, remove it
-        # if it is present.
+ 
         model_output_parts = model_output.partition(self.start_token)
         model_output = (
             model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
         )
-
-        # Check if the model output contains the </think> tokens.
-        # If the end token is not found, return the model output as is.
-        if self.end_token not in model_output:
-            return None, model_output
-
-        # Extract reasoning content from the model output.
+ 
         reasoning, _, content = model_output.partition(self.end_token)
-
-        final_content = content or None
+        final_content = content.strip() if content and content.strip() else None
         return reasoning, final_content

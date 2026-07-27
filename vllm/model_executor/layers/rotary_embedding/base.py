@@ -237,20 +237,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         self._match_cos_sin_cache_dtype(query)
         # ops.rotary_embedding() is an in-place operation
         # that updates the query and key tensors.
-        if key is None:
-            # XPU kernel doesn't support key=None so fall back to native impl
-            # TODO(sarckk): add support for optional key in
-            # ipex.llm.functional.rotary_embedding_batched
-            return self.forward_native(positions, query, key)
-        else:
-            ops.rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+        ops.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
     def forward_cpu(

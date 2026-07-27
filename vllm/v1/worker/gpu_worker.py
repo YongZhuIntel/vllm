@@ -414,6 +414,22 @@ class Worker(WorkerBase):
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
+        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
+        # allocator and are not discarded during sleep/wake cycles.
+        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
+            self.model_runner, "_init_kv_zero_meta"
+        ):
+            # if current_platform.is_xpu():
+            #     logger.warning_once(
+            #         "Skipping KV cache zero metadata initialization on XPU "
+            #         "because KVBlockZeroer uses device addresses that do "
+            #         "not fit the current XPU path. Newly allocated Mamba "
+            #         "KV blocks will not be proactively zeroed."
+            #     )
+            # else:
+            self.model_runner._init_kv_zero_meta()
+
     def compile_or_warm_up_model(self) -> None:
         warmup_sizes = []
 
@@ -529,7 +545,7 @@ class Worker(WorkerBase):
             )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
-            else:
+            elif not self.model_runner.use_spec_decode:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
         # Reset the seed to ensure that the random state is not affected by

@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from itertools import product as iprod
+from typing import Any
 
 import torch
 from typing_extensions import deprecated
@@ -15,13 +18,171 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal.cache import processor_only_cache_from_config
 from vllm.multimodal.registry import MultiModalRegistry
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import AttentionMetadataBuilder
 from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+)
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _zero_kv_blocks_kernel(
+    seg_addrs_ptr,
+    block_ids_ptr,
+    n_blocks,
+    N_SEGS: tl.constexpr,
+    PAGE_SIZE_EL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Zero KV cache blocks across all segments in a single launch.
+
+    Each segment is a contiguous region of one block's data.  For backends
+    where blocks are outermost (block_dim=0) there is one segment per
+    buffer.  For backends where K/V is outermost (block_dim=1) there are
+    two segments per buffer (one for K, one for V).
+
+    seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
+    allowing segments to live in different CUDA allocations.
+
+    Programs are mapped as (block_index, seg_index, chunk_index).
+    """
+    pid = tl.program_id(0)
+    chunks = PAGE_SIZE_EL // BLOCK_SIZE
+    work_per_block = N_SEGS * chunks
+    block_index = pid // work_per_block
+    if block_index >= n_blocks:
+        return
+    remainder = pid % work_per_block
+    seg_index = remainder // chunks
+    chunk_index = remainder % chunks
+    block_id = tl.load(block_ids_ptr + block_index)
+    seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    offset = (
+        block_id.to(tl.int64) * PAGE_SIZE_EL
+        + chunk_index.to(tl.int64) * BLOCK_SIZE
+    )
+    cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
+
+
+class KVBlockZeroer:
+    """Zeros newly-allocated KV-cache blocks via a Triton kernel.
+
+    The kernel writes int32 zeros which covers float16/bfloat16/fp8 values.
+    Construction is cheap; the expensive part (``zero``) is called only when
+    there are blocks to clear.
+    """
+
+    def __init__(
+        self,
+        kv_caches: list[torch.Tensor],
+        kv_cache_config: KVCacheConfig,
+        backend: type[AttentionBackend],
+        kernel_block_sizes: list[int] | list[int | None],
+    ) -> None:
+        # Collect per-group segment addresses and page sizes.
+        seg_addrs: list[int] = []
+        page_sizes_el: list[int] = []
+        block_dim: int | None = None
+        block_dim_resolved = False
+
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, (FullAttentionSpec, EncoderOnlyAttentionSpec)):
+                continue
+
+            buf = kv_caches[group_idx]
+            kbs = kernel_block_sizes[group_idx]
+            num_kv_heads = spec.num_kv_heads
+            head_size = spec.head_size
+            block_size = kbs if kbs is not None else spec.block_size
+
+            # Resolve block_dim once from the first attention spec.
+            if not block_dim_resolved:
+                block_dim = backend.get_kv_cache_block_dim(
+                    block_size, num_kv_heads, head_size)
+                block_dim_resolved = True
+
+            if block_dim is None or block_dim == 0:
+                # Shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
+                page_el = 2 * block_size * num_kv_heads * head_size
+                seg_addrs.append(buf.data_ptr())
+                page_sizes_el.append(page_el)
+            else:
+                # Shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+                page_el = block_size * num_kv_heads * head_size
+                for kv_idx in range(2):
+                    seg_addrs.append(buf[kv_idx].data_ptr())
+                    page_sizes_el.append(page_el)
+
+        if not seg_addrs:
+            self._seg_addrs_t: torch.Tensor | None = None
+            return
+
+        page_size_el = page_sizes_el[0]
+        assert all(p == page_size_el for p in page_sizes_el), (
+            "All attention groups must have the same page size in elements"
+        )
+
+        # Convert to int32 element count (kernel writes int32).
+        assert (buf.element_size() * page_size_el) % 4 == 0
+        page_size_int32 = (buf.element_size() * page_size_el) // 4
+        block_size_triton = largest_power_of_2_divisor(page_size_int32)
+
+        self._seg_addrs_t = torch.tensor(
+            seg_addrs, dtype=torch.uint64, device=buf.device
+        )
+        self._n_segs = len(seg_addrs)
+        self._page_size_int32 = page_size_int32
+        self._block_size_triton = block_size_triton
+        self._max_block_ids = 512
+        self._block_ids_buf = torch.empty(
+            self._max_block_ids, dtype=torch.int32, device=buf.device
+        )
+
+    # ------------------------------------------------------------------
+
+    def zero(self, block_ids: Iterable[int]) -> None:
+        """Zero the listed block IDs across every segment."""
+        if self._seg_addrs_t is None:
+            return
+
+        ids = list(block_ids)
+        if not ids:
+            return
+
+        n = len(ids)
+        if n > self._max_block_ids:
+            self._max_block_ids = n
+            self._block_ids_buf = torch.empty(
+                n, dtype=torch.int32, device=self._seg_addrs_t.device
+            )
+
+        buf = self._block_ids_buf[:n]
+        buf.copy_(torch.tensor(ids, dtype=torch.int32))
+
+        chunks = self._page_size_int32 // self._block_size_triton
+        grid = (n * self._n_segs * chunks,)
+        _zero_kv_blocks_kernel[grid](
+            self._seg_addrs_t,
+            buf,
+            n,
+            N_SEGS=self._n_segs,
+            PAGE_SIZE_EL=self._page_size_int32,
+            BLOCK_SIZE=self._block_size_triton,
+        )
 
 
 class MultiModalBudget:
@@ -354,7 +515,8 @@ def bind_kv_cache(
                 # not in a way that's impacted by ignoring this.
                 pass
             else:
-                raise NotImplementedError
+                pass
+                #raise NotImplementedError
         layer_name = layer_names[0]
         runner_kv_caches.append(kv_caches[layer_name])
 

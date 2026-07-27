@@ -667,6 +667,7 @@ class FusedMoE(CustomOp):
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in (
             "GPTQMarlinMoEMethod",
+            "XPUGPTQMarlinMoEMethod",
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
         ):
@@ -1411,7 +1412,10 @@ class FusedMoE(CustomOp):
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
                 param = getattr(self, param_name)
-                success = self.weight_loader(
+                # Use param's weight_loader if available (may be patched for
+                # deferred materialization), otherwise fall back to self
+                loader = getattr(param, "weight_loader", self.weight_loader)
+                success = loader(
                     param=param,
                     loaded_weight=loaded_weight,
                     weight_name=weight_name,
@@ -1697,6 +1701,9 @@ class FusedMoE(CustomOp):
         """
         Some combine kernels reduce across GPU ranks by default.
         """
+        import os
+        if os.environ.get("SKIP_ALL_REDUCE", "0") == "1":
+            return final_hidden_states
         if self.must_reduce_shared_expert_outputs():
             return final_hidden_states
         else:
@@ -1707,6 +1714,7 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # print("Using forward_native for MoE layer:", self.layer_name)
         og_hidden_states = hidden_states.shape[-1]
         if self.hidden_size != og_hidden_states:
             hidden_states = F.pad(
@@ -1766,6 +1774,7 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # print("Using forward_cuda for MoE layer:", self.layer_name)
         return self.forward_native(hidden_states, router_logits)
 
     def forward_impl_chunked(
@@ -1774,6 +1783,7 @@ class FusedMoE(CustomOp):
         full_router_logits: torch.Tensor,
         has_separate_shared_experts: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # print("Using forward_impl_chunked for MoE layer:", self.layer_name)
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
         assert self.batched_hidden_states.dtype == full_hidden_states.dtype
@@ -1889,6 +1899,7 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # print("Using forward_impl for MoE layer:", self.layer_name)
         assert self.quant_method is not None
 
         self.ensure_moe_quant_config_init()

@@ -33,6 +33,7 @@ class MMEncoderAttention(CustomOp):
         num_kv_heads: int | None = None,
         prefix: str = "",
         multimodal_config: MultiModalConfig | None = None,
+        attn_backend_override: "AttentionBackendEnum | None" = None,
     ) -> None:
         """
         Args:
@@ -43,6 +44,8 @@ class MMEncoderAttention(CustomOp):
             prefix: This has no effect, it is only here to make it easier to
                     swap between Attention and MultiHeadAttention
             multimodal_config: configs for multi-modal.
+            attn_backend_override: Explicit attention backend override.
+                                   Takes precedence over multimodal_config.
         """
         super().__init__()
 
@@ -62,16 +65,16 @@ class MMEncoderAttention(CustomOp):
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
 
-        # Try to get vision attention backend from multimodal_config.
-        attn_backend_override = None
-        if multimodal_config is not None:
-            attn_backend_override = multimodal_config.mm_encoder_attn_backend
+        # Try to get vision attention backend from explicit override or multimodal_config.
+        backend_override = attn_backend_override
+        if backend_override is None and multimodal_config is not None:
+            backend_override = multimodal_config.mm_encoder_attn_backend
 
         # Get device-specific vision attention backend.
         self.attn_backend = get_vit_attn_backend(
             head_size=head_size,
             dtype=dtype,
-            attn_backend_override=attn_backend_override,
+            attn_backend_override=backend_override,
         )
 
         self.is_flash_attn_backend = self.attn_backend in {
@@ -182,6 +185,68 @@ class MMEncoderAttention(CustomOp):
             output = output.reshape(bsz, q_len, -1)
         return output
 
+    def _forward_ipex(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Input shape:
+        (batch_size x seq_len x num_heads x head_size)
+        Uses IPEX varlen_attention for XPU.
+        """
+        from einops import rearrange
+
+        from vllm._ipex_ops import ipex_ops
+
+        bsz, q_len = query.size()[:2]  
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+
+        query, key, value = self.maybe_reshape_qkv_to_4d(
+            query, key, value, bsz, q_len, kv_len
+        )
+
+        # Flatten batch and sequence dimensions: (b, s, h, d) -> (b*s, h, d)
+        query = rearrange(query, "b s h d -> (b s) h d")
+        key = rearrange(key, "b s h d -> (b s) h d")
+        value = rearrange(value, "b s h d -> (b s) h d")
+
+        output = torch.empty(
+            query.shape,
+            dtype=query.dtype,
+            device=query.device)
+
+        ipex_ops.varlen_attention(
+            query,
+            key,
+            value,
+            output,
+            cu_seqlens,
+            cu_seqlens,
+            None,
+            max_seqlen,
+            max_seqlen,
+            pdropout=0.0,
+            softmax_scale=self.scale if self.scale else 1.0 / (self.head_size ** 0.5),
+            zero_tensors=False,
+            is_causal=False,
+            return_softmax=False,
+            gen_=None,
+            window_size_left=-1,
+            window_size_right=-1,
+            logits_soft_cap=-1,
+        )
+
+        # Reshape back: (b*s, h, d) -> (b, s, h, d)
+        output = rearrange(output, "(b s) h d -> b s h d", b=bsz)
+
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
+
     def forward_native(
         self,
         query: torch.Tensor,
@@ -228,7 +293,12 @@ class MMEncoderAttention(CustomOp):
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
-        assert self.is_flash_attn_backend, (
-            "XPU only supports FLASH_ATTN for vision attention."
-        )
-        return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
+        if self.is_flash_attn_backend:
+            return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
+        elif self.attn_backend == AttentionBackendEnum.IPEX:
+            return self._forward_ipex(query, key, value, cu_seqlens, max_seqlen)
+        else:
+            raise ValueError(
+                f"Unsupported multi-modal encoder attention backend for XPU: "
+                f"{self.attn_backend}."
+            )

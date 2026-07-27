@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -17,8 +19,84 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops
 
     reshape_and_cache_flash = ipex_ops.reshape_and_cache_flash
-    flash_attn_varlen_func = ipex_ops.flash_attn_varlen_func
     get_scheduler_metadata = ipex_ops.get_scheduler_metadata
+
+    # Supported values: "cutlass" (default), "xetla" (ipex fallback)
+    _XPU_FLASH_BACKEND = os.environ.get(
+        "VLLM_XPU_FLASH_ATTN_BACKEND", "cutlass").lower()
+
+    if _XPU_FLASH_BACKEND == "cutlass":
+        try:
+            from vllm_xpu_kernels import (
+                flash_attn_varlen_func as _cutlass_flash_attn_varlen_func,
+            )
+            logger.info(
+                "Using cutlass flash attention backend for XPU (TTFT).")
+        except ImportError as e:
+            logger.warning(
+                "VLLM_XPU_FLASH_ATTN_BACKEND=cutlass but "
+                "vllm_xpu_kernels not available: %s. "
+                "Falling back to xetla (ipex).", e)
+            _XPU_FLASH_BACKEND = "xetla"
+
+    if _XPU_FLASH_BACKEND == "cutlass":
+
+        def flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=None,
+            causal=False,
+            out=None,
+            block_table=None,
+            alibi_slopes=None,
+            window_size=None,
+            softcap=0.0,
+            seqused_k=None,
+            cu_seqlens_k=None,
+            dropout_p=0.0,
+            scheduler_metadata=None,
+            fa_version=2,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            num_splits=0,
+            s_aux=None,
+            return_softmax_lse=False,
+        ):
+            result = _cutlass_flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_k,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_k=seqused_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap if softcap else 0.0,
+                alibi_slopes=alibi_slopes,
+                block_table=block_table,
+                return_softmax_lse=return_softmax_lse,
+                out=out,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                s_aux=s_aux,
+                num_splits=num_splits,
+            )
+            if return_softmax_lse:
+                return result
+            if isinstance(result, tuple):
+                return result[0]
+            return result
+
+    else:
+        flash_attn_varlen_func = ipex_ops.flash_attn_varlen_func
 
 elif current_platform.is_rocm():
     try:
@@ -92,10 +170,16 @@ def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
 
 
 def flash_attn_supports_fp8() -> bool:
+    if current_platform.is_xpu():
+        return True
     return (
         get_flash_attn_version() == 3
         and current_platform.is_device_capability_family(90)
     )
+
+
+def flash_attn_supports_quant_query_input() -> bool:
+    return not current_platform.is_xpu()
 
 
 def flash_attn_supports_sinks() -> bool:

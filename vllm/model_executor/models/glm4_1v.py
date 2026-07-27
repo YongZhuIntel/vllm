@@ -306,6 +306,7 @@ class Glm4vVisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
             multimodal_config=multimodal_config,
+            attn_backend_override=AttentionBackendEnum.IPEX,
         )
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
@@ -749,6 +750,7 @@ class Glm4vVisionTransformer(nn.Module):
         if (
             self.attn_backend == AttentionBackendEnum.FLASH_ATTN
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
+            or self.attn_backend == AttentionBackendEnum.IPEX
         ):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
@@ -961,7 +963,7 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
             max_total_frames // max(max_videos, 1), _MAX_FRAMES_PER_VIDEO
         )
 
-        return max(max_frames_per_video, 1)
+        return max(max_frames_per_video, 2)
 
     def _get_video_second_idx_glm4v(
         self, metadata: dict[str, Any], total_frames: int

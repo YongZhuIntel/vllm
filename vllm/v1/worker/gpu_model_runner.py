@@ -154,7 +154,11 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.cp_utils import (
+    check_attention_cp_compatibility,
+    get_total_cp_world_size,
+)
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -171,6 +175,7 @@ from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
     AttentionGroup,
+    KVBlockZeroer,
     MultiModalBudget,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
@@ -431,6 +436,9 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        self.use_spec_decode = False
+        if self.speculative_config:
+            self.use_spec_decode = True
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
@@ -683,6 +691,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -834,6 +843,46 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _init_kv_zero_meta(self) -> None:
+        """One-time precomputation for _zero_block_ids.
+
+        Constructs a KVBlockZeroer with the runner's KV cache tensors,
+        config, attention backend, and kernel block sizes.
+        Called from gpu_worker.py outside the CuMem pool context.
+        """
+        # Find the attention backend from a non-Mamba attention group.
+        # Mamba backends do not implement get_kv_cache_shape, so we must
+        # use an attention backend (any AttentionSpec subclass).
+        backend: type[AttentionBackend] | None = None
+        for attn_group in self._attn_group_iterator():
+            if isinstance(attn_group.kv_cache_spec, AttentionSpec):
+                backend = attn_group.backend
+                break
+        if backend is None:
+            return  # No standard attention groups → nothing to zero.
+        self._kv_block_zeroer = KVBlockZeroer(
+            kv_caches=self.kv_caches,
+            kv_cache_config=self.kv_cache_config,
+            backend=backend,
+            kernel_block_sizes=self._kernel_block_sizes,
+        )
+
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero(block_ids)
+        # Also zero Mamba/GDN state blocks — KVBlockZeroer only handles
+        # FullAttentionSpec, so MambaSpec blocks must be zeroed separately
+        # to prevent stale data from corrupting conv_state/ssm_state.
+        for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                kv_cache = self.kv_caches[group_idx]
+                # Mamba kv_cache is a list of state tensors [conv_state, ssm_state]
+                state_list = kv_cache if isinstance(kv_cache, list) else [kv_cache]
+                for state_tensor in state_list:
+                    for bid in block_ids:
+                        if bid < state_tensor.shape[0]:
+                            state_tensor[bid].zero_()
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -856,6 +905,11 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
+        # Zero GPU memory for freshly allocated cache blocks to prevent
+        # stale NaN/data from corrupting attention or SSM computation.
+        if scheduler_output.new_block_ids_to_zero:
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -1070,7 +1124,7 @@ class GPUModelRunner(
         self.input_batch.refresh_metadata()
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor
+        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update the cached states after model execution.
 
@@ -1106,6 +1160,16 @@ class GPUModelRunner(
         )
         for i, num_tokens in enumerate(num_accepted_tokens):
             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+        if self.cache_config.mamba_cache_mode == "align":
+            mamba_utils.postprocess_mamba(
+                scheduler_output,
+                self.kv_cache_config,
+                self.input_batch,
+                self.requests,
+                self.mamba_state_idx,
+                self.compilation_config.static_forward_context,
+                self.model.get_mamba_state_copy_func(),
+            )
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
@@ -1344,6 +1408,92 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _prepare_inputs_decode_fast(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
+        """Fast path for pure-decode steps where every request schedules
+        exactly 1 token.  Avoids heavy numpy array ops on size-1-per-req
+        data and skips unnecessary computation.
+
+        Persistent-buffer caching: query_start_loc and discard_request_mask
+        have fixed decode-mode values ([0,1,...,N,N,N,...] and all-zero).
+        We tag the GPU buffers with a marker once written and skip the H2D
+        on subsequent fast-path calls as long as num_reqs doesn't shrink.
+        """
+        # -- block table: still need full commit (new blocks may arrive) --
+        self.input_batch.block_table.commit_block_table(num_reqs)
+
+        # -- positions: each request's position = num_computed_tokens --
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        positions_np = self.positions.np[:num_reqs]
+        positions_np[:] = computed
+
+        # -- input_ids (non-async case): vectorized token lookup --
+        if self.input_batch.prev_sampled_token_ids is None:
+            max_model_len = self.input_batch.token_ids_cpu.shape[1]
+            token_indices = (
+                computed
+                + self.arange_np[:num_reqs] * max_model_len
+            )
+            np.take(
+                self.input_batch.token_ids_cpu.ravel(),
+                token_indices,
+                out=self.input_ids.np[:num_reqs],
+            )
+
+        # -- slot_mapping --
+        req_indices = self.arange_np[:num_reqs]
+        self.input_batch.block_table.compute_slot_mapping(
+            req_indices, positions_np)
+        self.input_batch.block_table.commit_slot_mapping(num_reqs)
+
+        # -- query_start_loc: [0, 1, 2, ..., num_reqs, num_reqs, ...] --
+        # This pattern is invariant for decode. Cache the GPU copy and
+        # only re-upload if the cached size is smaller than current need,
+        # or if the previous call was a non-decode step (slow path).
+        cached_n = getattr(self, '_decode_qsl_cached_n', -1)
+        if cached_n < num_reqs:
+            qsl = self.query_start_loc.np
+            qsl[:num_reqs + 1] = self.arange_np[:num_reqs + 1]
+            qsl[num_reqs + 1:] = num_reqs
+            self.query_start_loc.copy_to_gpu()
+            self._decode_qsl_cached_n = num_reqs
+        elif cached_n > num_reqs:
+            # Old cached GPU has values [0,1,...,cached_n,cached_n,...]; we need
+            # padding region to be num_reqs instead of cached_n. Re-upload.
+            qsl = self.query_start_loc.np
+            qsl[:num_reqs + 1] = self.arange_np[:num_reqs + 1]
+            qsl[num_reqs + 1:] = num_reqs
+            self.query_start_loc.copy_to_gpu()
+            self._decode_qsl_cached_n = num_reqs
+        # else: cached_n == num_reqs, GPU already has correct values. Skip H2D.
+        query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+
+        # -- seq_lens: computed + 1 --
+        self.seq_lens.np[:num_reqs] = computed + 1
+        self.seq_lens.np[num_reqs:] = 0
+        self.seq_lens.copy_to_gpu()
+
+        # -- discard_request_mask: always False for decode --
+        # Persistent: once zeroed, no need to re-upload unless slow path
+        # corrupted it.
+        if not getattr(self, '_decode_mask_is_zero', False):
+            self.discard_request_mask.np[:num_reqs] = 0
+            self.discard_request_mask.copy_to_gpu(num_reqs)
+            self._decode_mask_is_zero = True
+
+        # -- H2D for input_ids / positions --
+        # cu_num_tokens for decode = [1, 2, 3, ..., num_reqs]
+        cu_num_tokens = self.arange_np[1:num_reqs + 1].copy()
+        self._prepare_input_ids(
+            scheduler_output, num_reqs, cu_num_tokens)
+        self.positions.copy_to_gpu(num_reqs)
+
+        logits_indices = query_start_loc[1:] - 1
+        return logits_indices, None
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1361,6 +1511,21 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+
+        # Fast path: pure decode, every request scheduling exactly 1 token.
+        # Only safe when req_id_to_index maps to contiguous [0, num_reqs),
+        # which is guaranteed when there are no finished/new requests this step.
+        if (total_num_scheduled_tokens == num_reqs
+                and not self.uses_mrope
+                and not (self.uses_xdrope_dim > 0)
+                and not self.enable_prompt_embeds
+                and not scheduler_output.scheduled_spec_decode_tokens
+                and not self.lora_config
+                and not scheduler_output.finished_req_ids
+                and not scheduler_output.scheduled_new_reqs
+                and not scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+            return self._prepare_inputs_decode_fast(
+                scheduler_output, num_reqs)
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1468,6 +1633,8 @@ class GPUModelRunner(
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+        # Slow path wrote non-decode values; invalidate fast-path cache.
+        self._decode_qsl_cached_n = -1
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
@@ -1485,6 +1652,9 @@ class GPUModelRunner(
             self.seq_lens.np[:num_reqs] < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
+        # Slow path may write non-zero; invalidate fast-path cache if so.
+        if self.discard_request_mask.np[:num_reqs].any():
+            self._decode_mask_is_zero = False
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2750,7 +2920,6 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
 
     def _bookkeeping_sync(
@@ -3236,6 +3405,18 @@ class GPUModelRunner(
 
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+            if self.cache_config.mamba_cache_mode == "align":
+                mamba_utils.preprocess_mamba(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.cache_config,
+                    self.mamba_state_idx,
+                    self.input_batch,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                    self.model.get_mamba_state_copy_func(),
+                )
+
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -3413,6 +3594,10 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        self._update_states_after_model_execute(
+            sampler_output.sampled_token_ids, scheduler_output
+        )
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -4712,6 +4897,9 @@ class GPUModelRunner(
                         dummy_modality
                     ]
 
+                    if self.model_config.hf_config.model_type == "minicpmv":
+                        max_mm_items_per_batch = 1
+
                     logger.info(
                         "Encoder cache will be initialized with a budget of "
                         "%s tokens, and profiled with %s %s items of the "
@@ -4743,7 +4931,7 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not self.use_spec_decode:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
@@ -5297,6 +5485,24 @@ class GPUModelRunner(
             for kv_cache_group in kv_cache_config.kv_cache_groups
             if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
         ]
+        max_num_blocks = []
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            max_num_blocks_per_req = cdiv(
+                max_model_len, block_sizes[i] * get_total_cp_world_size()
+            )
+            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+                mamba_blocks_per_req = (
+                    max_num_blocks_per_req
+                    if self.cache_config.enable_prefix_caching
+                    else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                max_num_blocks_per_req = max(
+                    max_num_blocks_per_req, mamba_blocks_per_req
+                )
+            max_num_blocks.append(max_num_blocks_per_req)
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
             self.cache_config.block_size
@@ -5308,18 +5514,18 @@ class GPUModelRunner(
             )
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
-                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
-                num_speculative_tokens=self.num_spec_tokens,
             )
 
     def _allocate_kv_cache_tensors(
@@ -5638,6 +5844,7 @@ class GPUModelRunner(
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
         kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+        self._kernel_block_sizes = kernel_block_sizes
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)

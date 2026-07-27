@@ -144,6 +144,19 @@ TorchProfilerActivityMap = {
 }
 
 
+def get_torch_profiler_trace_handler(
+    profiler_config: ProfilerConfig,
+    worker_name: str,
+):
+    if not profiler_config.torch_profiler_save_traces:
+        return None
+    return torch.profiler.tensorboard_trace_handler(
+        profiler_config.torch_profiler_dir,
+        worker_name=worker_name,
+        use_gzip=profiler_config.torch_profiler_use_gzip,
+    )
+
+
 class TorchProfilerWrapper(WorkerProfiler):
     def __init__(
         self,
@@ -179,10 +192,9 @@ class TorchProfilerWrapper(WorkerProfiler):
             profile_memory=profiler_config.torch_profiler_with_memory,
             with_stack=profiler_config.torch_profiler_with_stack,
             with_flops=profiler_config.torch_profiler_with_flops,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                torch_profiler_trace_dir,
-                worker_name=worker_name,
-                use_gzip=profiler_config.torch_profiler_use_gzip,
+            on_trace_ready=get_torch_profiler_trace_handler(
+                profiler_config,
+                worker_name,
             ),
         )
 

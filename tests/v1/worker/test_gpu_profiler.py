@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from vllm.config import ProfilerConfig
-from vllm.profiler.wrapper import WorkerProfiler
+from vllm.profiler.wrapper import TorchProfilerWrapper, WorkerProfiler
 
 
 class ConcreteWorkerProfiler(WorkerProfiler):
@@ -202,3 +205,52 @@ def test_mixed_delay_and_stop(default_profiler_config):
     profiler.step()
 
     assert profiler.start_call_count == 0
+
+
+def test_torch_profiler_wrapper_disables_trace_export(monkeypatch):
+    captured = {}
+
+    class FakeProfiler:
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def key_averages(self):
+            return SimpleNamespace(table=lambda **kwargs: "table")
+
+    def fake_trace_handler(*args, **kwargs):
+        captured["trace_handler_called"] = True
+        return "trace-handler"
+
+    def fake_profile(**kwargs):
+        captured["profile_kwargs"] = kwargs
+        return FakeProfiler()
+
+    monkeypatch.setattr(torch.profiler, "tensorboard_trace_handler", fake_trace_handler)
+    monkeypatch.setattr(torch.profiler, "profile", fake_profile)
+
+    TorchProfilerWrapper(
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir="/tmp/mock",
+            torch_profiler_save_traces=False,
+        ),
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU"],
+    )
+
+    assert captured["profile_kwargs"]["on_trace_ready"] is None
+    assert "trace_handler_called" not in captured
+
+
+def test_profiler_config_reads_save_traces_from_env(monkeypatch):
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/mock")
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_SAVE_TRACES", "0")
+
+    profiler_config = ProfilerConfig()
+
+    assert profiler_config.profiler == "torch"
+    assert profiler_config.torch_profiler_save_traces is False
