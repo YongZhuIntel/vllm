@@ -179,6 +179,15 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        # glob() returns directory order, which is arbitrary. Shard order is
+        # normally invisible, but anything that buffers per-layer state across
+        # the weight stream (e.g. the iGPU cold-expert staging in
+        # igpu_moe_capacity) pays for it: a layer whose two halves live in
+        # different shards stays buffered until both are seen, and a scrambled
+        # order stretches that window across the whole checkpoint. Zero-padded
+        # shard names sort into numeric order, which keeps the window minimal.
+        hf_weights_files.sort()
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(

@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
 )
+from vllm.model_executor.layers.fused_moe import igpu_moe_capacity
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_router import (
     FusedMoERouter,
@@ -659,10 +660,36 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
                 # On first call, materialize the relevant meta-device tensor
                 # We materialize w13 and w2 independently so that whichever
                 # finishes loading first gets quantized immediately.
+                weight_name = kwargs.get("weight_name")
+                if weight_name is None and len(args) >= 1:
+                    weight_name = args[0]
                 shard_id = kwargs.get("shard_id")
                 if shard_id is None and len(args) >= 2:
                     shard_id = args[1]
+                expert_id = kwargs.get("expert_id")
+                if expert_id is None and len(args) >= 3:
+                    expert_id = args[2]
                 is_w13 = shard_id in ("w1", "w3")
+
+                # iGPU capacity mode: shards whose expert maps to -1 are cold
+                # and get diverted into the sidecar staging area by
+                # FusedMoE.weight_loader. They never touch w13/w2 on this
+                # device, so they must stay out of the streaming-quant
+                # bookkeeping below -- the hot half completes (and deletes its
+                # counter) while cold shards are still arriving, and the first
+                # cold shard after that would hit a deleted _w13_loaded_numel.
+                if getattr(layer, "_igpu_cold_k", 0):
+                    use_global_sf = (
+                        getattr(layer.quant_method, "use_global_sf", False)
+                        and weight_name is not None
+                        and "input_scale" in weight_name
+                    )
+                    if (expert_id is not None and not use_global_sf
+                            and layer._map_global_expert_id_to_local_expert_id(
+                                expert_id) == -1):
+                        return orig_weight_loader(
+                            param, loaded_weight, *args, **kwargs
+                        )
 
                 # Materialize w13 on first w1/w3 call
                 if is_w13 and not hasattr(layer, "_w13_materialized"):
@@ -911,16 +938,23 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        return layer.ipex_fusion(
-            x,
-            layer.use_grouped_topk,
-            layer.top_k,
-            router_logits,
-            layer.renormalize,
-            layer.topk_group,
-            layer.num_expert_group,
-            custom_routing_function=layer.custom_routing_function,
-        )
+        def _hot():
+            return layer.ipex_fusion(
+                x,
+                layer.use_grouped_topk,
+                layer.top_k,
+                router_logits,
+                layer.renormalize,
+                layer.topk_group,
+                layer.num_expert_group,
+                custom_routing_function=layer.custom_routing_function,
+            )
+
+        # 容量模式:ipex_fusion 只持有 hot 的 E-K 个专家,冷的那 K 个在 iGPU
+        # sidecar 上。先发请求让 iGPU 开工,再提交 dGPU 的 hot,最后相加。
+        if igpu_moe_capacity.layer_uses_cold(layer):
+            return igpu_moe_capacity.apply_with_cold(layer, _hot, x, router_logits)
+        return _hot()
 
 
 class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):

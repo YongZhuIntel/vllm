@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from enum import Enum
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe import igpu_moe_capacity
 from vllm.model_executor.layers.fused_moe.fused_moe_router import FusedMoERouter
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
@@ -519,6 +521,16 @@ class FusedMoE(CustomOp):
                 None,
             )
 
+        # iGPU 冷专家「容量模式」(VLLM_XPU_IGPU_MOE_CAPACITY=1)。
+        # 必须在 self.moe_config 与 create_weights 之前动 local_num_experts /
+        # _expert_map —— 那两处一读到 E-K,独显就只会分配 E-K 份权重,
+        # 冷专家从头到尾不会在独显上 materialize。
+        self._igpu_cold_k: int = 0
+        self._igpu_cold_lid: int = -1
+        self._igpu_cold_sidecar = None
+        if igpu_moe_capacity.capacity_mode_enabled():
+            self._init_igpu_cold_split()
+
         self.top_k = top_k
 
         self._init_aiter_shared_experts_topK_buffer(
@@ -672,6 +684,52 @@ class FusedMoE(CustomOp):
             "CompressedTensorsWNA16MoEMethod",
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
+
+        # 容量模式:在分配权重之前把 sidecar 拉起来 —— weight_loader 一开始跑就要
+        # 往它的共享内存里写冷专家,而且失败要在加载权重前就暴露出来。
+        if self._igpu_cold_k:
+            # 路由相关的校验只能放到这里 —— _init_igpu_cold_split() 跑得太早,
+            # 那时这几个属性还不存在。两半必须用完全一样的路由,否则 top_k 会
+            # 选出不同的专家集合,相加就不等于完整 MoE 了。
+            if self.custom_routing_function is not None:
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_MOE_CAPACITY: custom_routing_function cannot "
+                    "be replicated inside the iGPU sidecar; the hot and cold "
+                    "halves would route differently.")
+            if self.e_score_correction_bias is not None:
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_MOE_CAPACITY: e_score_correction_bias is not "
+                    "supported (the two halves would score differently).")
+            if self.routed_scaling_factor not in (None, 1.0):
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_MOE_CAPACITY: routed_scaling_factor="
+                    f"{self.routed_scaling_factor} is not plumbed through to "
+                    "the sidecar.")
+            if self.apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "VLLM_XPU_IGPU_MOE_CAPACITY: apply_router_weight_on_input "
+                    "is not supported.")
+            self._igpu_cold_sidecar = igpu_moe_capacity.attach(
+                igpu_moe_capacity.build_cfg(
+                    global_experts=self.global_num_experts,
+                    cold_k=self._igpu_cold_k,
+                    hidden=hidden_size,
+                    inter=self.intermediate_size_per_partition,
+                    is_act_and_mul=self.moe_config.is_act_and_mul,
+                    top_k=self.top_k,
+                    renormalize=self.renormalize,
+                    use_grouped_topk=self.use_grouped_topk,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    scoring_func=self.scoring_func,
+                    activation=self.activation,
+                    param_dtype=params_dtype,
+                    act_dtype=self.moe_config.in_dtype,
+                    logits_dtype=self.moe_config.router_logits_dtype,
+                    max_tokens=int(
+                        vllm_config.scheduler_config.max_num_batched_tokens),
+                )
+            )
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
@@ -1101,6 +1159,126 @@ class FusedMoE(CustomOp):
             return expert_id
         return self._expert_map[expert_id].item()
 
+    # ------------------------------------------------------------------ #
+    # iGPU 冷专家容量模式
+    # ------------------------------------------------------------------ #
+    def _init_igpu_cold_split(self) -> None:
+        """把 [E-K, E) 从"本 rank 持有"里摘掉,交给 iGPU sidecar。
+
+        实现手段就是 EP 那套 ``expert_map``:冷专家映射成 -1。区别只在于
+        -1 的那些不是"别的 rank 会算",而是"本进程的 iGPU sidecar 会算"。
+        """
+        if self.use_ep or self.ep_size > 1 or self.tp_size > 1 or self.dp_size > 1:
+            raise NotImplementedError(
+                "VLLM_XPU_IGPU_MOE_CAPACITY only supports tp=dp=ep=1 "
+                f"(got tp={self.tp_size} dp={self.dp_size} ep={self.ep_size}). "
+                "The cold split is itself an uneven expert-parallel rank; "
+                "combining it with real EP is not implemented.")
+        if not current_platform.is_xpu():
+            raise NotImplementedError(
+                "VLLM_XPU_IGPU_MOE_CAPACITY is XPU-only.")
+        if os.getenv("VLLM_XPU_IGPU_MOE", "0") == "1":
+            raise ValueError(
+                "VLLM_XPU_IGPU_MOE (perf offload) and VLLM_XPU_IGPU_MOE_CAPACITY "
+                "are mutually exclusive: the former keeps a *second* copy of the "
+                "cold experts on the dGPU, which is the opposite of what the "
+                "latter is for. Unset VLLM_XPU_IGPU_MOE.")
+        # NOTE: 这个函数跑在 __init__ 很早的位置(必须早于 moe_config /
+        # create_weights),此时 custom_routing_function / scoring_func /
+        # activation 等还没赋值 —— 与路由有关的校验放在下面 sidecar 挂载处。
+
+        k = igpu_moe_capacity.resolve_cold_k(self.global_num_experts)
+        if k <= 0:
+            return
+        hot = self.global_num_experts - k
+
+        expert_map = torch.full((self.global_num_experts,), -1, dtype=torch.int32)
+        expert_map[:hot] = torch.arange(hot, dtype=torch.int32)
+        self.local_num_experts = hot
+        self._expert_map = expert_map
+        self._igpu_cold_k = k
+        self._igpu_cold_lid = igpu_moe_capacity.next_layer_id()
+
+        if self._igpu_cold_lid == 0:
+            if igpu_moe_capacity.disable_conflicting_fast_paths():
+                logger.warning(
+                    "VLLM_XPU_IGPU_MOE_CAPACITY: forcing DISABLE_ESIMD_MOE=1. "
+                    "The ESIMD MoE fast path indexes w13_weight by the global "
+                    "expert count and would silently compute only the hot half."
+                )
+            logger.info(
+                "VLLM_XPU_IGPU_MOE_CAPACITY: %d/%d experts per layer stay on "
+                "the dGPU, %d are offloaded to the iGPU sidecar.",
+                hot, self.global_num_experts, k)
+
+    def _stage_cold_expert(
+        self,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        global_expert_id: int,
+        return_success: bool,
+    ) -> bool | None:
+        """把一个冷专家的权重分片写进 sidecar 的 registration 共享内存。
+
+        走的是与热专家**完全相同**的 ``_load_w13``/``_load_w2`` 分片逻辑,只是
+        目标张量换成共享内存里的视图,避免两半的 layout 出现偏差。
+        """
+        sidecar = self._igpu_cold_sidecar
+        assert sidecar is not None
+        cold_id = sidecar.cold_local_id(global_expert_id)
+        assert cold_id >= 0, (
+            f"expert {global_expert_id} mapped to -1 but is not in the cold "
+            f"range [{self.global_num_experts - self._igpu_cold_k}, "
+            f"{self.global_num_experts})")
+
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+        if loaded_weight.dim() != 2:
+            raise NotImplementedError(
+                "VLLM_XPU_IGPU_MOE_CAPACITY: expected one 2-D tensor per expert "
+                f"shard, got shape {tuple(loaded_weight.shape)} (fused/full-load "
+                "checkpoints are not supported on the cold path).")
+        # 在线量化路径(fp8)的 checkpoint 里专家只有裸权重;真出现 scale/g_idx
+        # 说明是预量化 checkpoint,冷专家侧还没实现,宁可炸也别算错。
+        if any(k in weight_name for k in ("scale", "g_idx", "zp", "qzeros")):
+            raise NotImplementedError(
+                "VLLM_XPU_IGPU_MOE_CAPACITY: pre-quantized MoE checkpoints "
+                f"(saw {weight_name!r}) are not supported yet; the cold half "
+                "only knows how to ingest raw bf16/fp16 expert weights. Use an "
+                "unquantized checkpoint with --quantization fp8 (online).")
+
+        lid = self._igpu_cold_lid
+        # 屏蔽外层 CopyNumelCounter:这些拷贝不属于独显那半边的加载进度统计。
+        with igpu_moe_capacity._no_dispatch():
+            loaded_weight = loaded_weight.to("cpu")
+            if shard_id == "w2":
+                dst = sidecar.staging_w2(lid, cold_id)
+                self._load_w2(
+                    expert_data=dst,
+                    shard_dim=1,
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                )
+                done = sidecar.note_staged(lid, n_w2=dst.numel())
+            else:
+                dst = sidecar.staging_w13(lid, cold_id)
+                self._load_w13(
+                    expert_data=dst,
+                    shard_dim=0,
+                    shard_id=shard_id,
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                )
+                # _load_w13 一次只写 w13 的一半(w1 或 w3),act_and_mul 时是 I 行
+                rows = dst.shape[0] // 2 if self.moe_config.is_act_and_mul \
+                    else dst.shape[0]
+                done = sidecar.note_staged(lid, n_w13=rows * dst.shape[1])
+
+        if done:
+            sidecar.register_layer(lid)
+        return True if return_success else None
+
     def _init_aiter_shared_experts_topK_buffer(
         self, vllm_config: VllmConfig, dp_size: int
     ):
@@ -1170,6 +1348,16 @@ class FusedMoE(CustomOp):
         )
 
         if expert_id == -1 and not use_global_sf:
+            # 容量模式:-1 不是"别的 rank 会加载",而是"这是冷专家,归 iGPU"。
+            # 分流到 sidecar 的暂存区,独显上不分配也不拷贝。
+            if self._igpu_cold_k:
+                return self._stage_cold_expert(
+                    loaded_weight=loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    global_expert_id=global_expert_id,
+                    return_success=return_success,
+                )
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
         # Hereafter, `expert_id` is local physical id

@@ -484,16 +484,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                         logger.warning("VLLM_XPU_IGPU_MOE offload failed (%s); "
                                        "falling back to full ipex.", e)
 
-        return layer.ipex_fusion(
-            x,
-            layer.use_grouped_topk,
-            layer.top_k,
-            router_logits,
-            layer.renormalize,
-            layer.topk_group,
-            layer.num_expert_group,
-            custom_routing_function=layer.custom_routing_function,
-        )
+        def _hot():
+            return layer.ipex_fusion(
+                x,
+                layer.use_grouped_topk,
+                layer.top_k,
+                router_logits,
+                layer.renormalize,
+                layer.topk_group,
+                layer.num_expert_group,
+                custom_routing_function=layer.custom_routing_function,
+            )
+
+        # 容量模式(VLLM_XPU_IGPU_MOE_CAPACITY):ipex_fusion 只有 hot 的 E-K 个
+        # 专家,冷的 K 个常驻 iGPU sidecar;prefill 和 decode 都要相加。
+        from vllm.model_executor.layers.fused_moe import igpu_moe_capacity
+
+        if igpu_moe_capacity.layer_uses_cold(layer):
+            return igpu_moe_capacity.apply_with_cold(layer, _hot, x, router_logits)
+        return _hot()
 
     if current_platform.is_cpu():
         forward_native = forward_cpu
